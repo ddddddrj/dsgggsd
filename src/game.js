@@ -14,7 +14,7 @@ import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
 import { SMAAPass } from 'three/addons/postprocessing/SMAAPass.js';
 import { GTAOPass } from 'three/addons/postprocessing/GTAOPass.js';
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
-import { Pass } from 'three/addons/postprocessing/Pass.js';
+import { Pass, FullScreenQuad } from 'three/addons/postprocessing/Pass.js';
 
 // Ядро: утилиты, профиль качества, рендерер, сцена, камера, небо, окружение.
 const $ = s => document.querySelector(s);
@@ -131,6 +131,105 @@ renderer.domElement.addEventListener('webglcontextlost', e=>{
   fatal('Видеокарта сбросила WebGL-контекст', 'Обычно это перегрев или нехватка видеопамяти. Перезагрузите страницу; при повторении выберите ?q=low.');
 });
 document.body.appendChild(renderer.domElement);
+/* ============================================================================
+   ОБЪЁМ ЗАТЕНЕНИЯ И ОТСКОКА (запекается при загрузке, в кадре — 2 выборки)
+   Рассеянный свет (небо, остекление, отражения) раньше был одинаковым везде:
+   в комнате дома так же светло, как посреди ангара, углы не темнеют — отсюда
+   «мучная», плоская картинка. Теперь две 3D-текстуры:
+   L (1 м) — доля открытых направлений в радиусе 9 м и доля тех, что упёрлись
+   в дерево (тёплый отскок от OSB); S (0.5 м) — контактное затенение в
+   радиусе 1.5 м (стыки стен и пола, под столами, за укрытиями).
+   Оба множителя действуют только на рассеянный свет и отражения окружения:
+   солнце и лампы по-прежнему дают свои тени.
+============================================================================ */
+const AVOL_BOX = { x0:-40, y0:-0.5, z0:-30, sx:80, sy:8, sz:60 };
+const AVOL_U = {
+  uAVolL: { value: null }, uAVolS: { value: null },
+  // простые объекты с x/y/z (не Vector3): общие для всех материалов, не клонируются
+  uAVolMin: { value: { x:AVOL_BOX.x0, y:AVOL_BOX.y0, z:AVOL_BOX.z0 } },
+  uAVolInv: { value: { x:1/AVOL_BOX.sx, y:1/AVOL_BOX.sy, z:1/AVOL_BOX.sz } },
+  // x — сила объёма (0 — выключен), y — сила тёплого отскока, z — контакт, w — затенение отражений
+  uAVolK:   { value: { x:1, y:1, z:1, w:1 } }
+};
+/** Высотный туман: плотнее у пола, у кровли реже; цвет с подсветкой со стороны солнца. */
+const FOG_U = {
+  uFogH:   { value: { x:0.0, y:5.5, z:0.35, w:0.92 } },     // x — отметка, y — масштаб высоты, z — доля ровной дымки, w — предел
+  uFogSun: { value: { r:0, g:0, b:0 } },
+  uFogSunDir: { value: { x:0, y:1, z:0 } }
+};
+function neutralVolume(){
+  const t = new THREE.Data3DTexture(new Uint8Array([255, 255, 0, 0]), 1, 1, 1);
+  t.format = THREE.RGFormat; t.needsUpdate = true; return t;
+}
+(function patchShaders(){
+  const neutral = neutralVolume();
+  AVOL_U.uAVolL.value = neutral; AVOL_U.uAVolS.value = neutral;
+  const C = THREE.ShaderChunk;
+  C.lights_pars_begin = C.lights_pars_begin + `
+#ifdef USE_AVOL
+  uniform sampler3D uAVolL, uAVolS;
+  uniform vec3 uAVolMin, uAVolInv;
+  uniform vec4 uAVolK;
+#endif`;
+  C.lights_fragment_end = `
+#ifdef USE_AVOL
+  {
+    // мировые позиция и нормаль из видовых (обратное жёсткое преобразование)
+    mat3 avR = mat3(viewMatrix);
+    vec3 avW = (-vViewPosition - viewMatrix[3].xyz) * avR;
+    vec3 avN = normal * avR;
+    vec2 avL = texture(uAVolL, (avW + avN*0.55 - uAVolMin)*uAVolInv).rg;
+    float avS = texture(uAVolS, (avW + avN*0.3 - uAVolMin)*uAVolInv).r;
+    float avOpen = mix(1.0, avL.x, uAVolK.x);
+    float avOcc = mix(1.0, avS, uAVolK.z);
+    // закрытые направления не чёрные: они отражают тот же рассеянный свет (≈0.2)
+    float avVis = (avOpen + (1.0 - avOpen)*0.2) * avOcc;
+    vec3 avBounce = vec3(0.64, 0.46, 0.27) * dot(irradiance + iblIrradiance, vec3(0.2126, 0.7152, 0.0722))
+                  * avL.y * 0.42 * uAVolK.y * avOcc;
+    irradiance = irradiance*avVis + avBounce;
+    iblIrradiance *= avVis;
+    // отражения неба и остекления не должны светиться в глухих комнатах и в углах
+    radiance *= mix(1.0, avVis*avVis, uAVolK.w);
+  }
+#endif
+` + C.lights_fragment_end;
+  // туман: высотный + ровная дымка, путь считается от камеры до точки
+  C.fog_pars_vertex = `#ifdef USE_FOG\n  varying vec3 vFogWorld;\n#endif\n`;
+  C.fog_vertex = `#ifdef USE_FOG\n  vFogWorld = (mvPosition.xyz - viewMatrix[3].xyz) * mat3(viewMatrix);\n#endif\n`;
+  C.fog_pars_fragment = `#ifdef USE_FOG
+  uniform vec3 fogColor; varying vec3 vFogWorld;
+  uniform vec4 uFogH; uniform vec3 uFogSun, uFogSunDir;
+  #ifdef FOG_EXP2
+    uniform float fogDensity;
+  #else
+    uniform float fogNear; uniform float fogFar;
+  #endif
+#endif\n`;
+  C.fog_fragment = `#ifdef USE_FOG
+  {
+    vec3 fr = vFogWorld - cameraPosition; float fd = max(length(fr), 1e-3);
+    #ifdef FOG_EXP2
+      float fH = uFogH.y, fy = fr.y/fH;
+      float fk = abs(fy) > 1e-3 ? (1.0 - exp(-fy))/fy : 1.0;
+      float od = fogDensity*fd*(exp(-(cameraPosition.y - uFogH.x)/fH)*fk*(1.0 - uFogH.z) + uFogH.z);
+      float fogFactor = min(1.0 - exp(-od), uFogH.w);
+    #else
+      float fogFactor = smoothstep(fogNear, fogFar, fd);
+    #endif
+    vec3 fCol = fogColor + uFogSun*pow(max(dot(fr/fd, uFogSunDir), 0.0), 6.0);
+    gl_FragColor.rgb = mix(gl_FragColor.rgb, fCol, fogFactor);
+  }
+#endif\n`;
+  for(const id of ['standard', 'physical']){
+    const L = THREE.ShaderLib[id];
+    Object.assign(L.uniforms, AVOL_U);
+    L.fragmentShader = '#define USE_AVOL\n' + L.fragmentShader;
+  }
+  for(const id in THREE.ShaderLib){
+    const L = THREE.ShaderLib[id];
+    if(L.uniforms && L.uniforms.fogColor) Object.assign(L.uniforms, FOG_U);
+  }
+})();
 
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(72, innerWidth/innerHeight, 0.04, 400);
@@ -193,7 +292,10 @@ function buildSky(){
 }
 function cv$1(w,h){ const c=document.createElement('canvas'); c.width=w; c.height=h; return [c, c.getContext('2d',{willReadFrequently:true})]; }
 function buildEnvironment(){
-  const [c,x] = cv$1(256,128);
+  // ширина = 4 × размер грани будущей кубокарты: PMREM обоих окружений одного
+  // размера, и подмена на снятое из ангара не перекомпилирует материалы
+  const EW = (Q.tex >= 0.75 ? 256 : 128)*4, EH = EW/2;
+  const [c,x] = cv$1(EW, EH); x.scale(EW/256, EH/128);
   // верх — свет из кровли, середина — стены ангара, низ — бетонный пол
   const g = x.createLinearGradient(0,0,0,128);
   g.addColorStop(0.00, '#cfd8e2');
@@ -221,7 +323,7 @@ function buildEnvironment(){
   pmrem.compileEquirectangularShader();
   const env = pmrem.fromEquirectangular(tex).texture;
   pmrem.dispose(); tex.dispose();
-  scene.environment = env;
+  scene.environment = env; BASE_ENV.tex = env;
 }
 
 
@@ -1357,6 +1459,184 @@ function installTexCache(){
   teamFlagTex = texCached('teamflag', teamFlagTex); flameAtlas = texCached('flameA', flameAtlas); smokeAtlas = texCached('smokeA', smokeAtlas);
   heightToNormal = texCached('h2n', heightToNormal); heightToAO = texCached('h2ao', heightToAO);
 }
+
+/* ---------------------------------------------------------------------------
+   ТКАНЬ МЕШКОВ И ГАБИОНОВ: плетёный полипропилен / геотекстиль. Рельеф теперь
+   в карте нормалей, а не в геометрии: мешки перестали быть «коробками» и
+   стали втрое легче (было ≈170 тыс. треугольников на мешки и габионы).
+--------------------------------------------------------------------------- */
+function fabricMaps(size, base, weave, dirt){
+  const [c, x] = cv(size, size), [h, hx] = cv(size, size);
+  x.fillStyle = `rgb(${base[0]},${base[1]},${base[2]})`; x.fillRect(0, 0, size, size);
+  hx.fillStyle = '#808080'; hx.fillRect(0, 0, size, size);
+  // переплетение: чередующиеся нити основы и утка
+  const n = weave, s = size/n;
+  for(let i=0;i<n;i++) for(let j=0;j<n;j++){
+    const over = (i + j) % 2 === 0;
+    const g = hx.createLinearGradient(i*s, j*s, over ? (i+1)*s : i*s, over ? j*s : (j+1)*s);
+    g.addColorStop(0, '#5a5a5a'); g.addColorStop(0.5, '#d8d8d8'); g.addColorStop(1, '#5a5a5a');
+    hx.fillStyle = g; hx.fillRect(i*s + 0.5, j*s + 0.5, s - 1, s - 1);
+    const k = 0.9 + rnd2()*0.2;
+    x.fillStyle = `rgba(${base[0]*k|0},${base[1]*k|0},${base[2]*k|0},0.6)`; x.fillRect(i*s, j*s, s, s);
+  }
+  // выгоревшие и грязные пятна, песок в складках
+  wrapDraw(x, size, ()=>{
+    for(let i=0;i<dirt;i++){
+      const px = rnd2()*size, py = rnd2()*size, r = size*(0.04 + rnd2()*0.16);
+      const g = x.createRadialGradient(px, py, 0, px, py, r);
+      const d = rnd2() < 0.6;
+      g.addColorStop(0, d ? 'rgba(52,44,30,.28)' : 'rgba(210,200,170,.18)'); g.addColorStop(1, 'rgba(0,0,0,0)');
+      x.fillStyle = g; x.fillRect(px - r, py - r, r*2, r*2);
+    }
+  });
+  grain(x, size, size, 0.05);
+  return { albedo: c, height: h };
+}
+/** Рельеф габиона: мешок выпирает в каждую ячейку сетки 75 мм (сетка — отдельный
+    альфа-материал поверх). */
+function hescoBulgeMaps(size, cells){
+  const [c, x] = cv(size, size), [h, hx] = cv(size, size);
+  x.fillStyle = '#8f8466'; x.fillRect(0, 0, size, size);
+  hx.fillStyle = '#000'; hx.fillRect(0, 0, size, size);
+  const s = size/cells;
+  for(let i=0;i<cells;i++) for(let j=0;j<cells;j++){
+    const g = hx.createRadialGradient((i+0.5)*s, (j+0.5)*s, 0, (i+0.5)*s, (j+0.5)*s, s*0.62);
+    g.addColorStop(0, '#fff'); g.addColorStop(1, '#222');
+    hx.fillStyle = g; hx.fillRect(i*s, j*s, s, s);
+    const k = 0.92 + rnd2()*0.16;
+    x.fillStyle = `rgba(${143*k|0},${132*k|0},${102*k|0},.5)`; x.fillRect(i*s, j*s, s, s);
+  }
+  // потёки песка и грязь снизу
+  for(let i=0;i<60;i++){ x.fillStyle = `rgba(70,58,40,${0.05 + rnd2()*0.1})`; x.fillRect(rnd2()*size, size*0.55 + rnd2()*size*0.45, 1 + rnd2()*3, 8 + rnd2()*40); }
+  grain(x, size, size, 0.05);
+  return { albedo: c, height: h };
+}
+function buildFabricMaterials(){
+  const bag = fabricMaps(TS(256), [120, 112, 80], 24, 18);
+  M.sandbag = new THREE.MeshStandardMaterial({ map: T(bag.albedo, 2, 1), normalMap: T(heightToNormal(bag.height, 1.6), 2, 1, false),
+    normalScale: new THREE.Vector2(0.9, 0.9), roughness: .96, metalness: 0, envMapIntensity: .35 });
+  const hb = hescoBulgeMaps(TS(256), 8);
+  // габион: грань 1 м, сетка 75 мм → на текстуру (8 ячеек) ≈ 0.6 м
+  M.hesco = new THREE.MeshStandardMaterial({ map: T(hb.albedo, 1.7, 2.2), normalMap: T(heightToNormal(hb.height, 3.2), 1.7, 2.2, false),
+    normalScale: new THREE.Vector2(1.2, 1.2), roughness: .95, metalness: 0, envMapIntensity: .3 });
+}
+
+/* ---------------------------------------------------------------------------
+   БЕТОН И ДЕРЕВО ВБЛИЗИ: мелкая деталь нормалей (растворяется к 12 м, чтобы
+   не рябило вдали) и мировые пятна на полу — масло, влага под проёмами кровли,
+   следы шин по проездам. Всё процедурно в шейдере, без новых текстур карты.
+--------------------------------------------------------------------------- */
+function detailNormalTex(size){
+  const [h, hx] = cv(size, size), img = hx.createImageData(size, size), d = img.data;
+  const n1 = makeNoise2(77), n2 = makeNoise2(91);
+  for(let y=0;y<size;y++) for(let x=0;x<size;x++){
+    // бесшовно: шум на торе (4D-обход не нужен — период кратен сетке)
+    const u = x/size*8, v = y/size*8;
+    const val = n1(u, v)*0.5 + n2(u*2, v*2)*0.3 + Math.random()*0.2;
+    const i = (y*size + x)*4; d[i] = d[i+1] = d[i+2] = val*255; d[i+3] = 255;
+  }
+  hx.putImageData(img, 0, 0);
+  const t = new THREE.CanvasTexture(heightToNormal(h, 3.5));
+  t.wrapS = t.wrapT = THREE.RepeatWrapping; t.anisotropy = MAXA();
+  return t;
+}
+const SURF_U = { uDetailN: { value: null }, uStains: { value: 1 } };
+function addSurfaceDetail(mat, opts){
+  const prev = mat.onBeforeCompile;
+  const stains = !!opts.stains, k = opts.detail ?? 0.35;
+  mat.onBeforeCompile = (sh, r)=>{
+    if(prev) prev(sh, r);
+    sh.uniforms.uDetailN = SURF_U.uDetailN;
+    sh.fragmentShader = sh.fragmentShader
+      .replace('#include <common>', `#include <common>
+        uniform sampler2D uDetailN;
+        float sdH(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7)))*43758.5453); }
+        float sdN(vec2 p){ vec2 i = floor(p), f = fract(p); f = f*f*(3.0 - 2.0*f);
+          return mix(mix(sdH(i), sdH(i + vec2(1,0)), f.x), mix(sdH(i + vec2(0,1)), sdH(i + vec2(1,1)), f.x), f.y); }
+        float sdF(vec2 p){ return sdN(p)*0.55 + sdN(p*2.03 + 7.1)*0.3 + sdN(p*4.1 + 3.3)*0.15; }`)
+      .replace('#include <roughnessmap_fragment>', `#include <roughnessmap_fragment>
+        vec3 sdW = (-vViewPosition - viewMatrix[3].xyz) * mat3(viewMatrix);
+        vec3 sdNw = normalize(vNormal * mat3(viewMatrix));
+        ${stains ? `
+        if(sdNw.y > 0.8 && sdW.y < 0.2){
+          // масляные пятна: тёмные и глянцевые
+          float oil = smoothstep(0.66, 0.8, sdF(sdW.xz*0.23 + 11.0)) * smoothstep(0.35, 0.6, sdN(sdW.xz*1.7));
+          // влажные пятна под проёмами кровли и у ворот: темнее, почти зеркальные
+          float wet = smoothstep(0.7, 0.86, sdF(sdW.xz*0.09 + 3.0));
+          // следы шин вдоль проездов (по оси x у баз и по z в пролётах)
+          float lane = smoothstep(0.55, 0.9, sdN(vec2(sdW.z*3.2, sdW.x*0.05))) * (1.0 - smoothstep(10.0, 13.0, abs(sdW.z))) * step(18.0, abs(sdW.x));
+          diffuseColor.rgb *= 1.0 - oil*0.55 - wet*0.28 - lane*0.12;
+          roughnessFactor = mix(roughnessFactor, 0.35, oil*0.8);
+          roughnessFactor = mix(roughnessFactor, 0.12, wet);
+        }` : ''}`)
+      .replace('#include <normal_fragment_maps>', `#include <normal_fragment_maps>
+        {
+          // трипланарная мелкая деталь в мировых координатах
+          vec3 an = abs(sdNw);
+          vec2 duv = an.y > max(an.x, an.z) ? sdW.xz : (an.x > an.z ? sdW.zy : sdW.xy);
+          vec2 dn = texture2D(uDetailN, duv*1.9).xy*2.0 - 1.0;
+          float fade = (1.0 - smoothstep(4.0, 12.0, length(vViewPosition))) * ${k.toFixed(2)};
+          vec3 tW = an.y > max(an.x, an.z) ? vec3(dn.x, 0.0, dn.y) : (an.x > an.z ? vec3(0.0, dn.y, dn.x) : vec3(dn.x, dn.y, 0.0));
+          normal = normalize(normal + mat3(viewMatrix) * tW * fade);
+        }`);
+  };
+  const key = mat.customProgramCacheKey ? mat.customProgramCacheKey() : '';
+  mat.customProgramCacheKey = ()=> key + '|sd' + (stains ? 1 : 0) + k;
+  return mat;
+}
+
+/* ---------------------------------------------------------------------------
+   ПРОГРЕВ ШЕЙДЕРОВ: всё, что впервые появляется посреди боя (обломки,
+   воронка, сорванная дверь, осколки стекла, снаряды), компилируется при
+   загрузке — иначе первый взрыв или пожар даёт фриз на сотни миллисекунд.
+--------------------------------------------------------------------------- */
+async function prewarmShaders(){
+  const G = new THREE.Group(), box = new THREE.BoxGeometry(0.1, 0.1, 0.1);
+  const mats = new Set([M.conc, M.wood, M.woodDark, M.osb, M.osb2, M.plywood, M.steel, M.crater, M.glass, M.ember,
+    DOOR.mat, cmat(0x3a1a12,{roughness:.8, metalness:.4, side:THREE.DoubleSide}), nadeAssets().fragMat, nadeAssets().bottleMat,
+    nadeAssets().ragMat, M.chrome, M.rubber]);
+  for(const p of DEST.props) for(const part of p.parts) if(!Array.isArray(part.mat)) mats.add(part.mat);
+  for(const m of mats){
+    if(!m) continue;
+    const g = box.clone(); ensureColorGeo(g, m);
+    const mesh = new THREE.Mesh(g, m); mesh.position.set(0, -50, 0); mesh.castShadow = true; G.add(mesh);
+  }
+  scene.add(G);
+  try{
+    if(renderer.compileAsync) await renderer.compileAsync(scene, camera);
+    else renderer.compile(scene, camera);
+  }catch(e){}
+  scene.remove(G);
+  G.traverse(o=>{ if(o.isMesh) o.geometry.dispose(); });
+}
+
+/* ---------------------------------------------------------------------------
+   ОТРАЖЕНИЯ: окружение снимается кубической камерой из самого ангара (а не
+   нарисованный градиент) — металл, стекло и машины отражают настоящие фермы,
+   стены и остекление. Переснимается, когда заметно сменилось время суток.
+--------------------------------------------------------------------------- */
+const ENVCAP = { rt:null, cam:null, pmrem:null, env:null, lastT:-1 };
+function captureEnvironment(){
+  const size = Q.tex >= 0.75 ? 256 : 128;
+  if(!ENVCAP.rt){
+    ENVCAP.rt = new THREE.WebGLCubeRenderTarget(size, { type: THREE.HalfFloatType });
+    ENVCAP.cam = new THREE.CubeCamera(0.3, 160, ENVCAP.rt);
+    ENVCAP.pmrem = new THREE.PMREMGenerator(renderer);
+  }
+  ENVCAP.cam.position.set(0, 4.5, -19);
+  // Частицы, лучи, оружие и копия для теней в кадр не попадают (у дочерних камер
+  // куба включён только слой 0). Прежнее окружение не снимаем: иначе все
+  // материалы перекомпилировались бы без него, а размер PMREM у них одинаковый.
+  const prevEnv = scene.environment;
+  ENVCAP.cam.update(renderer, scene);
+  const next = ENVCAP.pmrem.fromCubemap(ENVCAP.rt.texture).texture;
+  if(ENVCAP.env) ENVCAP.env.dispose();
+  ENVCAP.env = next;
+  scene.environment = next;
+  if(prevEnv && prevEnv !== next && prevEnv !== BASE_ENV.tex) prevEnv.dispose();
+  ENVCAP.lastT = DAY.t;
+}
+const BASE_ENV = { tex:null };
 
 // Материалы: PBR-материалы из процедурных карт + шейдер обугливания дерева.
 const MAPS = {}, M = {};
@@ -2913,6 +3193,12 @@ function updateShafts(){
     m.quaternion.copy(_shaftQ);
     m.scale.set(1, len, 1);
   }
+  if(dust){
+    const U = dust.material.uniforms; let n = 0;
+    for(const m of SHAFTS){ const h = m.userData.hole; if(!h || n >= 24) continue;
+      DUST_SHAFTS[n++].set(h.x, h.y, h.z, Math.max(h.w, h.d)); }
+    U.uShaftN.value = n; U.uShaftDir.value.copy(_shaftDir);
+  }
   for(const s of SPOT_POOL){
     const len = s.hole.y/down;
     // пятно уезжает по полу вслед за солнцем и растягивается к закату
@@ -2926,6 +3212,7 @@ function updateShafts(){
 }
 /* --- Пыль в воздухе: точки, подсвеченные в лучах --- */
 let dust;
+const DUST_SHAFTS = Array.from({length:24}, ()=> new THREE.Vector4());
 function buildDust(){
   const N = Q.dust;
   const pos = new Float32Array(N*3), rndv = new Float32Array(N);
@@ -2941,9 +3228,11 @@ function buildDust(){
   const m = new THREE.ShaderMaterial({
     transparent:true, depthWrite:false, blending:THREE.AdditiveBlending,
     uniforms:{ uTime:{value:0}, uSize:{value:1.15}, uOpacity:{value:0.5},
-               uPixelRatio:{value:renderer.getPixelRatio()} },
+               uPixelRatio:{value:renderer.getPixelRatio()},
+               uShaft:{value: DUST_SHAFTS}, uShaftN:{value:0}, uShaftDir:{value:new THREE.Vector3(0,-1,0)} },
     vertexShader:`
       attribute float aRnd; uniform float uTime,uSize,uPixelRatio;
+      uniform vec4 uShaft[24]; uniform int uShaftN; uniform vec3 uShaftDir;
       varying float vA;
       void main(){
         vec3 p = position;
@@ -2954,8 +3243,16 @@ function buildDust(){
         vec4 mv = modelViewMatrix*vec4(p,1.0);
         gl_Position = projectionMatrix*mv;
         gl_PointSize = clamp(uSize*uPixelRatio*(9.0/max(-mv.z,1.0)), 0.6, 3.2);
-        // ближе к свету сверху — ярче
-        vA = (0.30 + 0.70*aRnd) * smoothstep(0.0,3.0,p.y);
+        // пыль видна в столбах солнца, вне их — едва заметна (раньше светился весь объём)
+        float lit = 0.0;
+        for(int i=0;i<24;i++){
+          if(i >= uShaftN) break;
+          vec3 o = uShaft[i].xyz; vec3 dp = p - o;
+          float t = max(dot(dp, uShaftDir), 0.0);
+          float rr = uShaft[i].w*(0.55 + 0.31*clamp(t/max(o.y, 1.0), 0.0, 1.5));
+          lit = max(lit, 1.0 - smoothstep(rr*0.6, rr*1.05, length(dp - uShaftDir*t)));
+        }
+        vA = (0.30 + 0.70*aRnd) * smoothstep(0.0,3.0,p.y) * mix(0.1, 1.0, lit);
       }`,
     fragmentShader:`
       uniform float uOpacity; varying float vA;
@@ -3015,9 +3312,12 @@ const MOON_DIR = new THREE.Vector3(0,-1,0);
 let SUN_ELEV = 1, SUN_UP = true;
 /** Сила небесной заливки днём: ангар со сплошным остеклением и проёмами в
     кровле днём светлый, тени читаются, а не проваливаются в черноту. */
-const HEMI_DAY = 2.0;
+// Соотношение прямого солнца и рассеянного света ≈ 4:1, как в реальном ангаре:
+// раньше рассеянный был почти равен солнцу — теней не было, картинка «в муке».
+// Глухие места теперь затеняет объём AVOL, поэтому заливка может быть честной.
+const HEMI_DAY = 0.95;
 /** Сила заливки от остекления, проёмов кровли и отскока от бетона днём. */
-const FILL_DAY = 2.3;
+const FILL_DAY = 1.2;
 
 /** Линейная выборка из таблицы ключей с интерполяцией цветов в sRGB. */
 function sampleDay(t){
@@ -3086,7 +3386,7 @@ function applyDaylight(t){
   const R = 96;
   sun.position.copy(SUN_DIR).multiplyScalar(R).add(sunTarget.position);
   sun.color.copy(k.sunCol);
-  sun.intensity = k.sunI;
+  sun.intensity = k.sunI * 1.25;
   // Солнце не выключаем и тень у него не снимаем: смена числа источников или
   // теней перекомпилирует шейдеры всех материалов — фриз на закате и рассвете.
   // Ночью у него просто нулевая яркость, а карта теней не перерисовывается.
@@ -3101,7 +3401,7 @@ function applyDaylight(t){
 
   hemi.color.copy(k.hemiSky); hemi.groundColor.copy(k.hemiGnd);
   hemi.intensity = lerp(HEMI_DAY, 0.24, nightK);
-  ambient.intensity = k.amb;
+  ambient.intensity = k.amb * 0.5;
   updateFillProbe(k, nightK, moonI, elev);
 
   // небо
@@ -3115,12 +3415,16 @@ function applyDaylight(t){
   skyUniforms.uMoonDir.value.copy(MOON_DIR);
   skyUniforms.uMoon.value = nightK * smoothstep(-0.05, 0.3, MOON_DIR.y);
 
-  scene.fog.color.copy(k.fogCol);
-  scene.fog.density = k.fogD;
+  // дымка внутри ангара — это пыль в рассеянном свете: темнее и теплее неба
+  scene.fog.color.copy(k.fogCol).multiplyScalar(0.72);
+  scene.fog.density = k.fogD * 1.25;
   scene.background = k.fogCol;
+  const inscat = k.sunI * 0.028 * smoothstep(-0.05, 0.25, elev);
+  FOG_U.uFogSun.value.r = k.sunCol.r*inscat; FOG_U.uFogSun.value.g = k.sunCol.g*inscat; FOG_U.uFogSun.value.b = k.sunCol.b*inscat;
+  FOG_U.uFogSunDir.value.x = SUN_DIR.x; FOG_U.uFogSunDir.value.y = SUN_DIR.y; FOG_U.uFogSunDir.value.z = SUN_DIR.z;
   // отражения окружения держим умеренными: днём свет ровный, без блеска
-  scene.environmentIntensity = lerp(0.5, 0.08, nightK);
-  EXPO.base = k.exp * 0.9;
+  scene.environmentIntensity = lerp(0.42, 0.06, nightK);
+  EXPO.base = k.exp * 0.9 * 1.18;      // компенсация приглушённого рассеянного света
   renderer.toneMappingExposure = EXPO.base * SET.exp * EXPO.eye;
 
   // Стёкла темнеют к ночи, но подсвечиваются изнутри, когда горят фонари.
@@ -3141,7 +3445,7 @@ function applyDaylight(t){
   }
   if(shaftsOn) updateShafts();
   else for(const s of SPOT_POOL) s.mesh.visible = false;
-  if(dust) dust.material.uniforms.uOpacity.value = lerp(0.44, 0.09, nightK);
+  if(dust) dust.material.uniforms.uOpacity.value = lerp(0.9, 0.09, nightK);
 
   LAMP_LEVEL = k.lamp;
   setLampGlow(k.lamp);
@@ -3160,7 +3464,7 @@ function applyDaylight(t){
     gradePass.uniforms.uHighTint.value.setRGB(
       lerp(1.06, 1.12, nightK), lerp(1.00, 0.96, nightK), lerp(0.90, 0.80, nightK));
     gradePass.uniforms.uVig.value = lerp(0.42, 0.55, nightK);
-    gradePass.uniforms.uSat.value = lerp(0.84, 0.78, nightK);
+    gradePass.uniforms.uSat.value = lerp(1.06, 0.9, nightK);
   }
 
   // Карта теней перерисовывается, когда солнце заметно ушло: на слабой
@@ -3176,7 +3480,7 @@ const GradeShader = {
     tDiffuse:{value:null}, uVig:{value:0.18}, uSat:{value:1.04},
     uShadowTint:{value:new THREE.Color(0.78,0.84,0.98)},   // холодные тени
     uHighTint:{value:new THREE.Color(1.06,1.00,0.90)},     // тёплые света
-    uLift:{value:0.008}, uContrast:{value:1.16}, uTemp:{value:0.0}
+    uLift:{value:0.0}, uContrast:{value:0.55}, uTemp:{value:0.0}
   },
   vertexShader:`varying vec2 vUv; void main(){ vUv=uv; gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0);} `,
   fragmentShader:`
@@ -3188,11 +3492,13 @@ const GradeShader = {
       vec4 c = texture2D(tDiffuse, vUv);
       vec3 col = max(c.rgb, 0.0);
 
-      // подъём чёрного: «плёночный» чёрный вместо провала в ноль
       col = col + uLift*(1.0 - col);
 
-      // S-кривая контраста вокруг средней точки
-      col = clamp((col - 0.5)*uContrast + 0.5, 0.0, 1.0);
+      // плёночная S-кривая: плотные тени и мягкие света без обрезки (линейный
+      // контраст вокруг 0.5 и подъём чёрного давали серую «муку»)
+      col = clamp(col, 0.0, 1.0);
+      vec3 sCurve = col*col*(3.0 - 2.0*col);
+      col = mix(col, sCurve, uContrast);
 
       // Раздельная тонировка с сохранением яркости: тени холоднее, света теплее,
       // но общая экспозиция не падает (иначе картинка уходит в мутную оливку).
@@ -3230,13 +3536,133 @@ class ViewmodelPass extends Pass {
 /** Всё прозрачное без записи глубины уходит в слой FX (один обход после сборки,
     дальше новые эффекты помечаются при создании). */
 function fxLayer(o){
-  o.traverse(m=>{ if(m.isMesh && m.material && !Array.isArray(m.material) && m.material.transparent && m.material.depthWrite === false) m.layers.set(LAYER_FX); });
+  // только то, что ещё в слое 0: частицы (LAYER_PFX) и оружие (LAYER_VM) уже на своих местах
+  o.traverse(m=>{ if(m.isMesh && m.layers.mask === 1 && m.material && !Array.isArray(m.material) && m.material.transparent && m.material.depthWrite === false) m.layers.set(LAYER_FX); });
   return o;
 }
-let composer, bloomPass, gradePass, smaaPass, aoPass, vmPass;
+/* ============================================================================
+   ЧАСТИЦЫ ОТДЕЛЬНЫМ ПРОХОДОМ В ПОЛОВИННОМ РАЗРЕШЕНИИ
+   Дым, пламя, пыль и искры рисуются в буфер вдвое меньшего размера (вчетверо
+   меньше пикселей — большие клубы дыма больше не съедают кадр) и сравнивают
+   глубину со сценой сами: там, где клуб входит в стену или потолок, он плавно
+   тает, а не режется прямой линией («мягкие частицы»). Затем буфер ложится
+   на кадр одним проходом, который заодно даёт мерцание горячего воздуха над
+   огнём и искажение ударной волны взрыва.
+============================================================================ */
+const LAYER_PFX = 4;
+const PFX_U = {
+  tDepth: { value: null },
+  uFxInv: { value: { x: 1, y: 1 } },                  // 1 / размер буфера частиц
+  uCamNF: { value: { x: 0.04, y: 400 } }
+};
+/** Хвост фрагментного шейдера частиц: мягкое сравнение глубины и перевод в
+    предумноженную альфу (обычные частицы и аддитивные смешиваются в одном буфере). */
+const PFX_GLSL_PARS = `
+  uniform sampler2D tDepth; uniform vec2 uFxInv, uCamNF;
+  float pfxSceneDepth(){
+    float d = texture2D(tDepth, gl_FragCoord.xy*uFxInv).r;
+    return uCamNF.x*uCamNF.y / (uCamNF.y - d*(uCamNF.y - uCamNF.x));
+  }`;
+/** Частица считается шаром радиуса ≈ размера квада: гаснет только там, где
+    поверхность врезается в неё глубже этого. Иначе пламя, сидящее на стене,
+    и дым у потолка тускнели бы целиком. */
+function pfxOut(soft, additive){
+  return `
+    float pfxR = vSize*${soft.toFixed(2)};
+    float pfxK = clamp((pfxSceneDepth() - vDepth + pfxR)/max(pfxR*1.6, 0.03), 0.0, 1.0);
+    if(pfxK <= 0.0) discard;
+    gl_FragColor.a *= pfxK;
+    gl_FragColor = vec4(gl_FragColor.rgb*gl_FragColor.a, ${additive ? '0.0' : 'gl_FragColor.a'});`;
+}
+function pfxMaterial(mat){
+  mat.blending = THREE.CustomBlending;
+  mat.blendSrc = THREE.OneFactor; mat.blendDst = THREE.OneMinusSrcAlphaFactor;
+  mat.blendSrcAlpha = THREE.OneFactor; mat.blendDstAlpha = THREE.OneMinusSrcAlphaFactor;
+  mat.depthTest = false; mat.depthWrite = false;
+  Object.assign(mat.uniforms, PFX_U);
+  return mat;
+}
+/** Проход сцены запоминает, в какой буфер рисовал: там лежит глубина для частиц. */
+class SceneRenderPass extends RenderPass {
+  render(r, writeBuffer, readBuffer, dt, mask){ this.target = readBuffer; super.render(r, writeBuffer, readBuffer, dt, mask); }
+}
+const WAVES = [];            // ударные волны на экране: {p, t, dur, k}
+function shockwave(p, k){ WAVES.push({ p: p.clone(), t: 0, dur: 0.55, k }); if(WAVES.length > 2) WAVES.shift(); }
+const _wv = new THREE.Vector3();
+class OffscreenFXPass extends Pass {
+  constructor(scenePass, scale){
+    super();
+    this.scenePass = scenePass; this.scale = scale;
+    this.rt = new THREE.WebGLRenderTarget(1, 1, { type: THREE.HalfFloatType, depthBuffer: false });
+    this.mat = new THREE.ShaderMaterial({
+      uniforms: { tScene: { value: null }, tFx: { value: null }, uTime: { value: 0 }, uAspect: { value: 1 },
+        uHeat: { value: 1 }, uWave: { value: [new THREE.Vector4(), new THREE.Vector4()] } },
+      vertexShader: `varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }`,
+      fragmentShader: `
+        uniform sampler2D tScene, tFx; uniform float uTime, uAspect, uHeat; uniform vec4 uWave[2];
+        varying vec2 vUv;
+        void main(){
+          vec4 fx = texture2D(tFx, vUv);
+          vec2 off = vec2(0.0);
+          // горячий воздух: яркие (аддитивные) области буфера частиц — это пламя
+          float heat = clamp(dot(fx.rgb, vec3(0.3, 0.5, 0.2)) - 0.25, 0.0, 1.0)*uHeat;
+          if(heat > 0.0){
+            vec2 q = vUv*vec2(uAspect, 1.0)*38.0 + vec2(0.0, -uTime*2.6);
+            off += vec2(sin(q.y + sin(q.x*0.7)*1.3), cos(q.x*1.1 + q.y*0.4))*0.0032*heat;
+          }
+          // ударная волна: тонкое кольцо, расходится и гаснет
+          for(int i=0;i<2;i++){
+            vec4 w = uWave[i]; if(w.w <= 0.0) continue;
+            vec2 d = (vUv - w.xy)*vec2(uAspect, 1.0); float r = length(d);
+            float ring = exp(-pow((r - w.z)/0.035, 2.0))*w.w;
+            off -= normalize(d + 1e-5)/vec2(uAspect, 1.0)*ring*0.035;
+          }
+          vec3 sc = texture2D(tScene, vUv + off).rgb;
+          gl_FragColor = vec4(sc*(1.0 - fx.a) + fx.rgb, 1.0);
+        }`,
+      depthTest: false, depthWrite: false
+    });
+    this.quad = new FullScreenQuad(this.mat);
+  }
+  setSize(w, h){
+    const W = Math.max(1, Math.round(w*this.scale)), H = Math.max(1, Math.round(h*this.scale));
+    this.rt.setSize(W, H);
+    PFX_U.uFxInv.value.x = 1/W; PFX_U.uFxInv.value.y = 1/H;
+    this.mat.uniforms.uAspect.value = w/Math.max(1, h);
+  }
+  render(r, writeBuffer, readBuffer){
+    const src = this.scenePass.target;
+    PFX_U.tDepth.value = src && src.depthTexture;
+    PFX_U.uCamNF.value.x = camera.near; PFX_U.uCamNF.value.y = camera.far;
+    const mask = camera.layers.mask, bg = scene.background, auto = r.autoClear;
+    r.setRenderTarget(this.rt); r.setClearColor(0x000000, 0); r.clear(true, false, false);
+    camera.layers.set(LAYER_PFX); scene.background = null; r.autoClear = false;
+    r.render(scene, camera);
+    camera.layers.mask = mask; scene.background = bg; r.autoClear = auto;
+    const U = this.mat.uniforms;
+    U.tScene.value = readBuffer.texture; U.tFx.value = this.rt.texture; U.uTime.value = GAME_T;
+    for(let i=0;i<2;i++){
+      const w = WAVES[i], v = U.uWave.value[i];
+      if(!w){ v.set(0,0,0,0); continue; }
+      _wv.copy(w.p).project(camera);
+      const k = w.t/w.dur, behind = _wv.z > 1;
+      const dist = Math.max(1, camera.position.distanceTo(w.p));
+      v.set(_wv.x*0.5 + 0.5, _wv.y*0.5 + 0.5, k*Math.min(0.9, 7/dist), behind ? 0 : (1 - k)*(1 - k)*w.k*Math.min(1, 9/dist));
+    }
+    r.setRenderTarget(this.renderToScreen ? null : writeBuffer);
+    this.quad.render(r);
+  }
+}
+function updateWaves(dt){ for(let i=WAVES.length-1;i>=0;i--){ WAVES[i].t += dt; if(WAVES[i].t >= WAVES[i].dur) WAVES.splice(i, 1); } }
+let composer, bloomPass, gradePass, smaaPass, aoPass, vmPass, fxPass, scenePass;
 function buildComposer(){
   composer = new EffectComposer(renderer);
-  composer.addPass(new RenderPass(scene, camera));
+  // глубина сцены — текстурой: её читают частицы в своём проходе
+  for(const t of [composer.renderTarget1, composer.renderTarget2]){
+    t.depthTexture = new THREE.DepthTexture(t.width, t.height); t.depthTexture.type = THREE.UnsignedIntType;
+  }
+  scenePass = new SceneRenderPass(scene, camera);
+  composer.addPass(scenePass);
   // Ambient occlusion: без контактных теней стыки стен/пола выглядят плоско.
   // Проход дорогой, поэтому на слабых профилях его заменяет запечённый AO
   // из карт высот — он уже есть у всех основных материалов.
@@ -3256,6 +3682,8 @@ function buildComposer(){
     aoPass.restoreVisibility = function(){ camera.layers.mask = this._mask; };
     composer.addPass(aoPass);
   }
+  fxPass = new OffscreenFXPass(scenePass, 0.5);
+  composer.addPass(fxPass);
   vmPass = new ViewmodelPass();
   composer.addPass(vmPass);
   if(Q.bloom){
@@ -3703,7 +4131,7 @@ const _pFwd = new THREE.Vector3(), _WHITE = [1,1,1];
     свечения; 'smoke' — освещённый дым: нормаль из атласа, солнце, небо и
     подсветка пламенем снизу, сортировка по глубине, растворение у камеры. */
 class Particles {
-  constructor({tex, max=500, additive=false, lit=false, stretch=false, kind='plain', sheet=1, sort=false}){
+  constructor({tex, max=500, additive=false, lit=false, stretch=false, kind='plain', sheet=1, sort=false, soft}){
     this.max = max; this.kind = kind; this.sheet = sheet; this.sort = sort;
     const g = QUAD.clone();
     const dyn = n => new THREE.InstancedBufferAttribute(new Float32Array(max*n), n).setUsage(THREE.DynamicDrawUsage);
@@ -3748,9 +4176,9 @@ class Particles {
       vertexShader:`
         attribute vec3 iPos; attribute vec4 iSR; attribute vec4 iCol; attribute vec3 iVel; attribute vec2 iExt;
         uniform float uStretch;
-        varying vec2 vUv; varying vec4 vCol; varying vec2 vExt; varying float vFrame, vRot, vDepth;
+        varying vec2 vUv; varying vec4 vCol; varying vec2 vExt; varying float vFrame, vRot, vDepth, vSize;
         void main(){
-          vUv = uv; vCol = iCol; vExt = iExt; vFrame = iSR.w; vRot = iSR.z;
+          vUv = uv; vCol = iCol; vExt = iExt; vFrame = iSR.w; vRot = iSR.z; vSize = max(iSR.x, iSR.y);
           vec4 mv = modelViewMatrix*vec4(iPos,1.0);
           vDepth = -mv.z;
           float c = cos(iSR.z), s = sin(iSR.z);
@@ -3769,15 +4197,18 @@ class Particles {
         }`,
       fragmentShader:`
         uniform sampler2D map; uniform vec3 uAmb, uSunDir, uSunCol, uFireCol; uniform float uSheet;
-        varying vec2 vUv; varying vec4 vCol; varying vec2 vExt; varying float vFrame, vRot, vDepth;
+        varying vec2 vUv; varying vec4 vCol; varying vec2 vExt; varying float vFrame, vRot, vDepth, vSize;
         vec2 frameUv(){
           if(uSheet < 1.5) return vUv;
           float f = floor(vFrame + 0.5), cx = mod(f, uSheet), cy = floor(f/uSheet);
           return (vec2(cx, uSheet - 1.0 - cy) + vUv)/uSheet;
         }
-        void main(){ ${frag} }`
+        ${PFX_GLSL_PARS}
+        void main(){ ${frag} ${pfxOut(soft ?? (kind === 'smoke' ? 0.3 : kind === 'flame' ? 0.4 : 0.5), additive)} }`
     });
+    pfxMaterial(mat);
     this.mesh = new THREE.Mesh(g, mat);
+    this.mesh.layers.set(LAYER_PFX);
     this.mesh.frustumCulled = false; this.mesh.renderOrder = additive ? 6 : 5;
     this.mesh.userData.nomerge = true;
     this.P = [];      // живые частицы
@@ -3798,7 +4229,7 @@ class Particles {
     q.drag = o.drag ?? 0.5; q.g = o.g ?? 0; q.turb = o.turb ?? 0; q.fadeIn = o.fadeIn ?? 0.05;
     q.heat = o.heat ?? 0; q.fps = o.fps ?? 0; q.ceil = o.ceil ?? 1e9; q.wind = o.wind ?? 0;
     q.frame = o.frame ?? (this.sheet > 1 ? Math.floor(Math.random()*this.sheet*this.sheet) : 0);
-    q.seed = Math.random()*100; q.floor = o.floor;
+    q.seed = Math.random()*100; q.floor = o.floor; q.seek = o.seek || null;
     this.P.push(q);
   }
   update(dt, time){
@@ -3812,6 +4243,12 @@ class Particles {
       const dr = Math.max(0, 1 - q.drag*dt);
       q.v.multiplyScalar(dr);
       q.p.addScaledVector(q.v, dt);
+      // дым под перекрытием тянется к проёму наружу и там уходит вверх
+      if(q.seek && q.p.y > q.ceil - 0.4){
+        const dx = q.seek.x - q.p.x, dz = q.seek.z - q.p.z, dd = Math.hypot(dx, dz);
+        if(dd < 0.8){ q.ceil = 1e9; q.seek = null; q.v.x += dx/(dd + 0.1)*0.6; q.v.z += dz/(dd + 0.1)*0.6; }
+        else { q.v.x += dx/dd*0.9*dt; q.v.z += dz/dd*0.9*dt; }
+      }
       // дым упирается в потолок и растекается под ним слоем
       if(q.p.y > q.ceil){
         q.p.y = q.ceil;
@@ -3958,8 +4395,10 @@ class Chips {
       c.r.addScaledVector(c.w, dt);
       if(c.p.y < c.floor + 0.004){
         c.p.y = c.floor + 0.004;
-        if(Math.abs(c.v.y) > 0.8){ c.v.y *= -0.32; c.v.x *= 0.55; c.v.z *= 0.55; c.w.multiplyScalar(0.5); }
-        else { c.rest = true; c.r.x = Math.round(c.r.x/Math.PI)*Math.PI; c.r.z = Math.round(c.r.z/Math.PI)*Math.PI; }
+        if(Math.abs(c.v.y) > 0.8){ if(this.onBounce && !c.bounced){ c.bounced = true; this.onBounce(c.p); } c.v.y *= -0.32; c.v.x *= 0.55; c.v.z *= 0.55; c.w.multiplyScalar(0.5); }
+        else { c.rest = true;
+          if(this.lie){ c.r.x = Math.PI/2; c.r.z = 0; c.p.y = c.floor + c.s.x*0.5; }           // цилиндр ложится на бок
+          else { c.r.x = Math.round(c.r.x/Math.PI)*Math.PI; c.r.z = Math.round(c.r.z/Math.PI)*Math.PI; } }
       }
     }
     const n = Math.min(P.length, this.max);
@@ -4196,6 +4635,14 @@ const SND = {
     if(surf==='metal') { this._tone(out, t, 0.25, rnd(500,900), 480, g*0.4); }
     this._burst(out, t, 0.07, 'lowpass', surf==='wood'?900:600, 150, 0.7, g);
   },
+  /** Гильза о бетон: короткий звон двух близких частот. */
+  tink(pos){
+    if(!this.ok) return; const now = this.ctx.currentTime;
+    if(now - (this._tinkT || 0) < 0.035) return; this._tinkT = now;
+    const out = this._out(pos, 0.15, 1.2), f = rnd(3600, 5200);
+    this._tone(out, now, rnd(0.06, 0.12), f, f*0.97, 0.05);
+    this._tone(out, now + 0.004, 0.08, f*1.37, f*1.33, 0.03);
+  },
   step(surf, k=1){
     if(!this.ok) return; const t = this.ctx.currentTime, out = this._out(null, 0.25);
     if(surf==='metal'){ this._tone(out, t, 0.12, rnd(700,1000), 600, 0.05*k); this._burst(out, t, 0.05, 'bandpass', 1800, 900, 2, 0.08*k); }
@@ -4282,7 +4729,7 @@ const FXS = {};
 function initFX(){
   const k = Q.dust >= 4000 ? 1 : (Q.dust >= 2000 ? 0.7 : 0.45);
   FXS.flame = new Particles({tex:FX.flameAtlas, max:Math.round(1100*k), additive:true, kind:'flame', sheet:4});
-  FXS.smoke = new Particles({tex:FX.smokeAtlas, max:Math.round(1500*k), lit:true, kind:'smoke', sheet:2, sort:true});
+  FXS.smoke = new Particles({tex:FX.smokeAtlas, max:Math.round(2200*k), lit:true, kind:'smoke', sheet:2, sort:true});
   FXS.dust  = new Particles({tex:FX.smokeAtlas, max:Math.round(900*k), lit:true, kind:'smoke', sheet:2, sort:true});
   FXS.spark = new Particles({tex:FX.glow,  max:600, additive:true, stretch:true});
   FXS.ember = new Particles({tex:FX.glow,  max:500, additive:true});
@@ -4295,13 +4742,17 @@ function initFX(){
   FXS.splinters = new Chips(box, M.wood, 700);
   FXS.concChips = new Chips(new THREE.DodecahedronGeometry(0.5,0), M.conc, 500);
   FXS.glassChips = new Chips(tri, M.glass, 500);
+  // гильзы 5,45: латунь, лежат на полу две минуты, звенят при падении
+  const caseGeo = new THREE.CylinderGeometry(0.5, 0.5, 1, 7); 
+  FXS.casings = new Chips(caseGeo, new THREE.MeshStandardMaterial({color:0xb08a3e, roughness:.32, metalness:.95, envMapIntensity:1.3}), Q.debris >= 400 ? 500 : 300);
+  FXS.casings.mesh.castShadow = false; FXS.casings.onBounce = tinkCasing; FXS.casings.lie = true;
   FXS.decals = new Decals(Q.dust >= 4000 ? 4000 : 2500);
   FXS.flashes = new Flashes(4);
   return FXS;
 }
 function updateFX(dt, t){
   for(const k of ['flame','smoke','dust','spark','ember','flash','fireball']) FXS[k].update(dt, t);
-  FXS.splinters.update(dt); FXS.concChips.update(dt); FXS.glassChips.update(dt);
+  FXS.splinters.update(dt); FXS.concChips.update(dt); FXS.glassChips.update(dt); FXS.casings.update(dt);
   FXS.flashes.update(dt);
 }
 
@@ -4988,7 +5439,8 @@ function impactFX(p, n, surf, dir){
   } else if(surf === 'conc'){
     const fl = floorBelow(p);
     for(let i=0;i<4;i++) FXS.concChips.spawn(p, n.clone().multiplyScalar(rnd(1,3)).add(V$3(rnd(-1,1),rnd(0,2),rnd(-1,1))), rnd(0.012,0.03), fl, rnd(4,8));
-    FXS.dust.spawn({p, v:n.clone().multiplyScalar(0.9), life:rnd(1,2), s0:0.1, s1:0.6, col:[0.7,0.68,0.64], a0:0.45, a1:0, drag:2.2});
+    FXS.dust.spawn({p, v:n.clone().multiplyScalar(1.6), life:rnd(0.5,0.9), s0:0.05, s1:0.45, col:[0.72,0.7,0.66], a0:0.6, a1:0, drag:5});
+    FXS.dust.spawn({p, v:n.clone().multiplyScalar(0.6).add(V$3(0,0.1,0)), life:rnd(2.2,3.6), s0:0.15, s1:1.1, col:[0.7,0.68,0.64], a0:0.28, a1:0, aPow:0.8, drag:2.2, g:-0.05});
     FXS.decals.add(p, n, rnd(0.06,0.09), 2, null);
     FXS.spark.spawn({p, v:n.clone().multiplyScalar(2), life:0.08, s0:0.05, s1:0.02, col:[1,0.8,0.6], a0:0.8, a1:0});
     SND.hit(p, 'conc');
@@ -6424,18 +6876,18 @@ const _hescoGeo = new Map();
 function hescoSandGeo(cell, h){
   const key = cell + '|' + h;
   if(_hescoGeo.has(key)) return _hescoGeo.get(key);
-  const seg = Q.tex >= 1 ? 6 : 3;
+  const seg = Q.tex >= 1 ? 3 : 2;
   const g = roundedBox(cell-0.04, h-0.04, cell-0.04, 0.1, seg);
   const pa = g.attributes.position, v = new THREE.Vector3(), nrm = new THREE.Vector3();
-  const half = (cell-0.04)/2, cellW = Q.tex >= 1 ? 0.075*2 : 0.075*4;
+  const half = (cell-0.04)/2;
   for(let i=0;i<pa.count;i++){
     v.fromBufferAttribute(pa, i);
     nrm.set(v.x/half, 0, v.z/half);
     const side = Math.max(Math.abs(nrm.x), Math.abs(nrm.z));
     // выпор между прутьями + общий «живот» к середине грани, верх просел
-    const bx = Math.abs(Math.sin((v.x + v.z)/cellW*Math.PI)), by = Math.abs(Math.sin(v.y/cellW*Math.PI));
+    // выпор ячеек сетки — в карте нормалей, геометрии остаётся общий «живот»
     const belly = (1 - Math.pow(Math.abs(v.y)/(h/2), 2))*0.035;
-    const k = side > 0.98 ? (belly + bx*by*0.012) : 0;
+    const k = side > 0.98 ? belly : 0;
     const len = Math.hypot(nrm.x, nrm.z) || 1;
     pa.setXYZ(i, v.x + nrm.x/len*k, v.y - (v.y > h/2 - 0.12 ? 0.03 : 0), v.z + nrm.z/len*k);
   }
@@ -6475,7 +6927,7 @@ let _bagGeos = null;
 function sandbagGeos(){
   if(_bagGeos) return _bagGeos;
   _bagGeos = [];
-  const seg = Q.tex >= 1 ? 5 : 3;
+  const seg = Q.tex >= 1 ? 3 : 2;
   for(let vi=0; vi<3; vi++){
     const bag = roundedBox(0.6, 0.16, 0.34, 0.065, seg);
     const pa = bag.attributes.position, ph = vi*1.7;
@@ -6810,7 +7262,7 @@ function base(teamKey){
 /* ---------- ворота ангара: приоткрытая створка, за ней дневной свет ---------- */
 function hangarGate(sx){
   const x = sx*(HW-0.3);
-  const outside = new THREE.Mesh(new THREE.PlaneGeometry(1.6, 6.6), new THREE.MeshBasicMaterial({color:0xfff6e4}));
+  const outside = new THREE.Mesh(new THREE.PlaneGeometry(1.6, 6.6), new THREE.MeshBasicMaterial({color:0xffffff, map: outsideTex(), fog:false}));
   outside.position.set(sx*(HW+0.25), 3.3, 1.2); outside.rotation.y = sx>0 ? -Math.PI/2 : Math.PI/2; outside.userData.nomerge = true; scene.add(outside);
   for(const [z0,z1] of [[-6.2, 0.4], [2.0, 6.2]]){
     const zc = (z0+z1)/2, w = z1-z0;
@@ -6828,6 +7280,123 @@ function hangarGate(sx){
   addOBB(sx*(HW+1.0), 3.0, 1.2, 0.3, 6.0, 2.4, null, 'metal', {noPlayer:true});
 }
 
+/* ============================================================================
+   НАПОЛНЕНИЕ КАРТЫ: кран-балка, кабельные лотки, маркировка комнат, вид за
+   воротами, гильзы на полу.
+============================================================================ */
+/** Мостовой кран под фермами: подкрановые пути вдоль ангара, мост с тельфером,
+    цепь и крюк. Статика — запекается вместе с ангаром. */
+function overheadCrane(){
+  const yR = EAVE - 1.15, zR = HD - 1.1, xB = 13.5;
+  for(const s of [-1, 1]){
+    addBox('steel', 0, yR, s*zR, HW*2 - 1.2, 0.36, 0.2, {collide:false, d:1});                 // подкрановая балка
+    addBox('steel', 0, yR + 0.2, s*zR, HW*2 - 1.2, 0.05, 0.08, {collide:false, d:1});          // рельс
+    for(let x = -HW + 3.75; x < HW - 1; x += COL_STEP) addBox('steel', x, yR - 0.35, s*(zR + 0.25), 0.18, 0.5, 0.5, {collide:false, d:1});   // консоли
+  }
+  // мост: две балки коробчатого сечения + концевые тележки
+  for(const dx of [-0.45, 0.45]) addBox('hazard', xB + dx, yR + 0.55, 0, 0.32, 0.62, zR*2, {collide:false, d:0.6});
+  for(const s of [-1, 1]) addBox('steel', xB, yR + 0.42, s*zR, 1.6, 0.34, 0.5, {collide:false, d:1});
+  // тельфер, цепь, крюк
+  const hz = -4.2;
+  addBox('steel', xB, yR + 0.1, hz, 0.8, 0.5, 0.7, {collide:false, d:1});
+  addBox('darker', xB, yR - 0.25, hz, 0.4, 0.3, 0.4, {collide:false, d:1});
+  const chainLen = 3.6, links = Math.round(chainLen/0.09);
+  for(let i=0;i<links;i++) addBox('darker', xB, yR - 0.45 - i*0.09, hz, i%2 ? 0.012 : 0.04, 0.085, i%2 ? 0.04 : 0.012, {collide:false, d:4});
+  const hy = yR - 0.45 - chainLen;
+  addBox('hazard', xB, hy - 0.1, hz, 0.22, 0.24, 0.12, {collide:false, d:1.5});
+  const hook = new THREE.TorusGeometry(0.09, 0.025, 6, 12, Math.PI*1.4); hook.rotateZ(-Math.PI*0.2); hook.translate(xB, hy - 0.32, hz);
+  bucket('darker').push(hook);
+}
+/** Кабельные лотки и короба по продольным стенам ангара, спуски к щитам. */
+function cableTrays(){
+  const y = WALL_H - 0.55;
+  for(const s of [-1, 1]){
+    const z = s*(HD - 0.45);
+    addBox('steel', 0, y, z, HW*2 - 2, 0.03, 0.34, {collide:false, d:1});                       // дно лотка
+    for(const e of [-1, 1]) addBox('steel', 0, y + 0.05, z + e*0.17, HW*2 - 2, 0.1, 0.012, {collide:false, d:1});
+    for(let i=0;i<3;i++) addBox('cable', 0, y + 0.03 + i*0.018, z - 0.06 + i*0.06, HW*2 - 2.2, 0.03, 0.03, {collide:false, d:1});
+    for(let x = -HW + 2; x < HW - 1; x += 2.5) addBox('steel', x, y + 0.18, z + s*0.2, 0.04, 0.36, 0.04, {collide:false, d:1});   // подвесы
+    // спуски к щитам у колонн
+    for(const x of [-26.25, -3.75, 18.75]){
+      addBox('steel', x, (y + 1.4)/2, z + s*0.12, 0.12, y - 1.4, 0.06, {collide:false, d:1});
+      addBox('panel', x, 1.25, z + s*0.05, 0.6, 0.8, 0.22, {collide:false, d:1.2});
+      addBox('hazard', x, 1.25, z - s*0.07, 0.12, 0.12, 0.012, {collide:false, d:3});
+    }
+  }
+}
+/** Номера комнат над дверями шут-хауса: трафарет краской, с потёками. */
+function roomLabels(){
+  const labels = [];
+  let n1 = 0, n2 = 0;
+  for(const d of DOORS){
+    const fl = d.y > 1 ? 2 : 1, id = fl === 1 ? ++n1 : ++n2;
+    labels.push({ d, text: `${fl}-${String(id).padStart(2, '0')}` });
+  }
+  if(!labels.length) return;
+  const C = 8, W = 128, H = 64, R = Math.ceil(labels.length/C);
+  const [c, x] = cv(C*W, R*H);
+  x.clearRect(0, 0, C*W, R*H);
+  labels.forEach((L, i)=>{
+    const ox = (i % C)*W, oy = Math.floor(i/C)*H;
+    x.save(); x.translate(ox + W/2, oy + H/2); x.rotate((rnd2() - 0.5)*0.05);
+    x.font = '700 38px "Arial Narrow",Arial,sans-serif'; x.textAlign = 'center'; x.textBaseline = 'middle';
+    x.fillStyle = 'rgba(28,26,24,.88)'; x.fillText(L.text, 0, 0);
+    // потёки краски
+    for(let k=0;k<4;k++){ x.fillRect(-40 + rnd2()*80, 10, 1.5, 6 + rnd2()*16); }
+    x.restore();
+  });
+  // трафаретные перемычки: разрывы в буквах
+  x.globalCompositeOperation = 'destination-out';
+  for(let i=0;i<labels.length*6;i++){ x.fillStyle = 'rgba(0,0,0,.9)'; x.fillRect(rnd2()*C*W, rnd2()*R*H, 2, 6); }
+  x.globalCompositeOperation = 'source-over';
+  const tex = new THREE.CanvasTexture(c); tex.colorSpace = THREE.SRGBColorSpace; tex.anisotropy = MAXA();
+  const mat = new THREE.MeshStandardMaterial({ map: tex, transparent: true, depthWrite: false, roughness: .9,
+    polygonOffset: true, polygonOffsetFactor: -3, polygonOffsetUnits: -3 });
+  const parts = [];
+  labels.forEach((L, i)=>{
+    const u0 = (i % C)/C, v1 = 1 - Math.floor(i/C)/R, u1 = u0 + 1/C, v0 = v1 - 1/R;
+    for(const side of [-1, 1]){
+      const g = new THREE.PlaneGeometry(0.34, 0.17);
+      const uv = g.attributes.uv; uv.setXY(0, u0, v1); uv.setXY(1, u1, v1); uv.setXY(2, u0, v0); uv.setXY(3, u1, v0);
+      const nx = Math.cos(L.d.ang), nz = -Math.sin(L.d.ang);        // нормаль стены
+      const off = (TH/2 + SHEET + 0.004)*side;
+      g.rotateY(Math.atan2(nx*side, nz*side));
+      g.translate(L.d.x + nx*off, L.d.y + DOOR_H + 0.3, L.d.z + nz*off);
+      parts.push(g);
+    }
+  });
+  const m = new THREE.Mesh(BGU.mergeGeometries(parts, false), mat);
+  m.userData.nomerge = true; m.receiveShadow = true; m.renderOrder = 2;
+  scene.add(m);
+}
+/** Вид за воротами: небо, дальняя лесополоса, забор и асфальт вместо белой плоскости. */
+let _outsideTex = null;
+function outsideTex(){
+  if(_outsideTex) return _outsideTex;
+  const W = 256, H = 1024, [c, x] = cv(W, H);
+  const sky = x.createLinearGradient(0, 0, 0, H*0.62);
+  sky.addColorStop(0, '#cfe0f2'); sky.addColorStop(1, '#f4f1ea');
+  x.fillStyle = sky; x.fillRect(0, 0, W, H*0.62);
+  // лесополоса на горизонте
+  x.fillStyle = '#6f7c64';
+  x.beginPath(); x.moveTo(0, H*0.62);
+  for(let i=0;i<=32;i++) x.lineTo(i*W/32, H*0.56 - Math.abs(Math.sin(i*1.7))*H*0.03 - rnd2()*H*0.02);
+  x.lineTo(W, H*0.62); x.fill();
+  // асфальт и разметка
+  const gr = x.createLinearGradient(0, H*0.62, 0, H);
+  gr.addColorStop(0, '#a8a49c'); gr.addColorStop(1, '#6c6962');
+  x.fillStyle = gr; x.fillRect(0, H*0.62, W, H*0.38);
+  x.fillStyle = 'rgba(230,220,170,.7)'; x.fillRect(W*0.62, H*0.64, 6, H*0.36);
+  // забор из сетки
+  x.strokeStyle = 'rgba(70,74,70,.55)'; x.lineWidth = 1;
+  for(let i=0;i<W;i+=6){ x.beginPath(); x.moveTo(i, H*0.5); x.lineTo(i + 12, H*0.62); x.stroke(); x.beginPath(); x.moveTo(i + 12, H*0.5); x.lineTo(i, H*0.62); x.stroke(); }
+  x.fillStyle = '#4b4f4a'; for(let i=0;i<W;i+=64) x.fillRect(i, H*0.48, 3, H*0.14);
+  grain(x, W, H, 0.03);
+  _outsideTex = new THREE.CanvasTexture(c); _outsideTex.colorSpace = THREE.SRGBColorSpace;
+  return _outsideTex;
+}
+/** Гильзы: остаются на полу (до 400), звенят при падении. */
+function tinkCasing(p){ if(SND.ok && Math.random() < 0.8) SND.tink(p); }
 function buildLayout(){
   setHeliHook((x,y,z,r)=> helicopter(x,y,z,r));
   base('ALPHA'); base('DELTA');
@@ -6923,6 +7492,8 @@ function buildLayout(){
   sym((x,z,r)=> extinguisher(x, 0, z, r), -39.5, -7.6, Math.PI/2);
 
   buildInterior();
+  overheadCrane();
+  cableTrays();
 }
 
 /* ---------- внутри здания: укрытия, мебель, мишени ---------- */
@@ -7084,6 +7655,30 @@ function refAliveSafe(ref){
   return false;
 }
 const _ft1 = new THREE.Vector3(), _ft2 = new THREE.Vector3(), _fpe = new THREE.Vector3(), _fve = new THREE.Vector3();
+/** Проёмы дома, выходящие в ангар (двери и окна, за которыми открыто). */
+let OPENINGS = null;
+function houseOpenings(){
+  if(OPENINGS) return OPENINGS;
+  OPENINGS = [];
+  for(const w of WALLS){
+    const ux = (w.x2 - w.x1)/w.len, uz = (w.z2 - w.z1)/w.len;
+    for(const o of w.ops){
+      const t = (o.t0 + o.t1)/2, p = new THREE.Vector3(w.x1 + ux*t, w.y0 + o.y1 - 0.12, w.z1 + uz*t);
+      const a = avolOpen(_fpe.set(p.x + w.nx*1.2, p.y, p.z + w.nz*1.2)), b = avolOpen(_fpe.set(p.x - w.nx*1.2, p.y, p.z - w.nz*1.2));
+      if(Math.max(a, b) > 0.55) OPENINGS.push({ p, floor: w.y0 });
+    }
+  }
+  return OPENINGS;
+}
+function nearestOpening(p, ceil){
+  let best = null, bd = 9;
+  for(const o of houseOpenings()){
+    if(o.p.y > ceil + 0.3 || o.p.y < ceil - 3.2) continue;
+    const d = Math.hypot(o.p.x - p.x, o.p.z - p.z);
+    if(d < bd){ bd = d; best = o.p; }
+  }
+  return best;
+}
 /** Высота, под которой копится дым этого очага (перекрытие, потолок, кровля). */
 function fireCeil(p, n){
   const ox = n ? n.x*0.35 : 0, oz = n ? n.z*0.35 : 0;      // от стены отходим наружу: луч из толщи стены её не видит
@@ -7097,7 +7692,7 @@ function emit(f, dt, t){
   const I = f.I; if(I <= 0.01) return;
   const big = clamp((f.cluster || 0)/5, 0, 1);
   const qk = Q.dust >= 2000 ? 1 : 0.7;
-  if(f.ceil === undefined) f.ceil = fireCeil(f.p, f.free ? null : f.n);
+  if(f.ceil === undefined){ f.ceil = fireCeil(f.p, f.free ? null : f.n); f.exit = f.ceil < 6 ? nearestOpening(f.p, f.ceil) : null; }
   const base = f.p;
   // касательные к горящей поверхности: пламя стелется по стене, а не шаром
   if(f.free){ _ft1.set(1,0,0); _ft2.set(0,0,1); }
@@ -7134,7 +7729,7 @@ function emit(f, dt, t){
       col:[1,0.45,0.12], a0:0.22*I, a1:0, fadeIn:0.15}); }
   // 4. дым: сажа от горящего дерева почти чёрная, тлеющее — светлый буро-серый дымок.
   //    Клубы поднимаются, раздуваются, подсвечены пламенем снизу и растекаются под потолком.
-  f._sacc = (f._sacc||0) + (1.3 + 3.2*I)*(1 + 1.3*big)*qk*dt;
+  f._sacc = (f._sacc||0) + (1.8 + 4.4*I)*(1 + 1.3*big)*qk*dt;
   while(f._sacc >= 1){
     f._sacc -= 1;
     _fpe.copy(base).add(_fve.set(rnd(-0.25,0.25), 0.4 + 0.5*I + rnd(0, 0.3), rnd(-0.25,0.25)));
@@ -7145,7 +7740,7 @@ function emit(f, dt, t){
     FXS.smoke.spawn({p:_fpe, v:_fve.set(rnd(-0.2,0.2), rnd(0.9,1.6)*(0.7 + 0.5*I), rnd(-0.2,0.2)), life:rnd(9,15),
       s0:0.7 + 0.6*I, s1:rnd(3.2,5.0)*(1 + 0.4*big)*(indoor ? 0.8 : 1), rot:rnd(0,6.28), spin:rnd(-0.12,0.12),
       col:[g*1.06, g*w, g*w*0.9], a0:lerp(0.3, 0.62, soot), a1:0, aPow:1.5, drag:0.35, g:0.35, turb:0.3, fadeIn:0.5,
-      heat:0.6 + 0.6*I, ceil:f.ceil, wind: indoor ? 0.004 : 0.014});
+      heat:0.6 + 0.6*I, ceil:f.ceil, wind: indoor ? 0.004 : 0.014, seek: f.exit});
   }
   if(Math.random() < (I*6 + big*8)*dt){
     FXS.ember.spawn({p: _fpe.copy(base).add(_fve.set(rnd(-0.3,0.3), rnd(0,0.5), rnd(-0.3,0.3))),
@@ -7350,6 +7945,12 @@ function footstep(c, k){
          else surf = SURF_NAME[h.idx] || 'conc'; }
   PL.lastSurf = surf;
   SND.step(surf === 'sand' ? 'conc' : surf, k);
+  // пыль из-под подошвы на бетоне; на бегу и при приземлении — заметнее
+  if((surf === 'conc' || surf === 'sand') && k >= 0.8 && h){
+    for(let i=0;i<(k > 1 ? 3 : 1);i++) FXS.dust.spawn({p: _fpe.set(c.x + rnd(-0.15,0.15), h.p.y + 0.05, c.z + rnd(-0.15,0.15)),
+      v: _fve.set(PL.vel.x*0.15 + rnd(-0.3,0.3), rnd(0.05,0.25), PL.vel.z*0.15 + rnd(-0.3,0.3)), life: rnd(1.2,2.2),
+      s0: 0.12, s1: 0.55*k, col:[0.62,0.6,0.56], a0: 0.1*k, a1: 0, drag: 2.5, fadeIn: 0.05});
+  }
 }
 /** Урон игроку. */
 const DEATH_BY = { fire:'сгорел', blast:'погиб от взрыва', fall:'разбился' };
@@ -7575,13 +8176,14 @@ function shoot(){
   PL.yaw += rnd(-25e-4, 0.0025);
   WPN.kick = Math.min(WPN.kick + 0.35, 2);
   SND.shot(null, true);
-  FXS.smoke.spawn({p:_mz, v:_tmp.copy(_dir).multiplyScalar(0.6).add(_sv.set(0,0.3,0)), life:1.2, s0:0.05, s1:0.4, col:[0.5,0.5,0.5], a0:0.25, a1:0, drag:2});
+  // пороховой дым: быстро рассеивается у ствола, но после очереди висит облачком
+  FXS.smoke.spawn({p:_mz, v:_tmp.copy(_dir).multiplyScalar(0.8).add(_sv.set(0,0.25,0)), life:rnd(2.2,3.5), s0:0.06, s1:0.75, col:[0.62,0.61,0.6], a0:0.22, a1:0, aPow:0.7, drag:2.2, turb:0.25, g:0.05});
   // гильза
   _su.set(0.06, 0.02, -0.05).applyQuaternion(camera.quaternion).add(camera.position);
   _sv.set(0.9,1.2,0.2).applyQuaternion(camera.quaternion).add(_tmp.set(rnd(-0.3,.3),rnd(0,.4),rnd(-0.3,.3)));
-  FXS.splinters.spawn(_su, _sv, CASE_SIZE, PL.eye.y - 1.6, 4);
+  FXS.casings.spawn(_su, _sv, CASE_SIZE, floorBelow(_su), 120);
 }
-const CASE_SIZE = V(0.009,0.009,0.03);
+const CASE_SIZE = V(0.0092, 0.039, 0.0092);
 function muzzleWorld(out = V()){ return out.set(0.0, 0.01, -0.66).applyMatrix4(WPN.viewmodel.matrixWorld); }
 
 /* ---------- граната ---------- */
@@ -7648,6 +8250,7 @@ const CRATERS = [];
 let _craterPlane = null;
 const CHUNK_S = [0.07, 0.1, 0.13, 0.16], _chunkGeo = [];
 function blastFX(p, big=1){
+  shockwave(p, big);
   FXS.flashes.fire(p.clone().add(V(0,0.4,0)), 0xffb070, 90*big, 22*big, 0.35);
   FXS.flash.spawn({p: p.clone().add(V(0,0.3,0)), life:0.12, s0:4*big, s1:6*big, col:[1,0.85,0.6], a0:1, a1:0});
   for(let i=0;i<Math.round(28*big);i++){
@@ -8263,6 +8866,8 @@ async function build(){
   await texCacheOpen();
   installTexCache();
   buildAllMaterials();
+  buildFabricMaterials();
+  SURF_U.uDetailN.value = detailNormalTex(TS(256));
   buildLights();
   initFX();
   status('Ангар…'); await frame();
@@ -8270,15 +8875,22 @@ async function build(){
   status('Шут-хаус: каркас, обшивка, лестницы…'); await frame();
   buildHouse();
   buildDoors();
+  roomLabels();
   status('Базы ALPHA / DELTA, укрытия, техника…'); await frame();
   buildLayout();
   buildFloor();
   buildTag();
+  addSurfaceDetail(M.conc, {stains:true, detail:0.45});
+  if(M.concPit) addSurfaceDetail(M.concPit, {stains:true, detail:0.45});
+  for(const m of [M.osb, M.osb2, M.wood, M.woodDark, M.plywood]) addSurfaceDetail(m, {detail:0.22});
+  addSurfaceDetail(M.panel, {detail:0.3});
   status('Запекание геометрии…'); await frame();
   flushBuckets();
   buildShafts(); buildWindowShafts(); buildDust();
   const baked = bakeScene();
   buildShadowProxy();
+  status('Рассеянный свет: затенение и отскок…'); await frame();
+  await buildAmbientVolume();
   scene.traverse(o=>{ if(o.isMesh && o.userData.glass && !o.userData.glassReg){ o.userData.glassReg = true; } });
   for(const o of collectGlass()) registerGlass(o, {hp:1});
   instanceGlass();
@@ -8305,6 +8917,10 @@ async function build(){
   scene.traverse(o=>{ if(o.isLight) o.layers.enable(LAYER_VM); });
   fxLayer(scene);
   applyDaylight(DAY.t);
+  status('Шейдеры и отражения…'); await frame();
+  renderer.shadowMap.needsUpdate = true;
+  await prewarmShaders();
+  captureEnvironment();
   renderer.shadowMap.needsUpdate = true;
   // стартовый вид: над картой, на здание
   camera.position.set(-24, 7.5, -22); camera.lookAt(0, 2, 0);
@@ -8316,6 +8932,170 @@ async function build(){
   setupUI();
   status('');
   if(!DEBUG.has('norun')) loop();
+}
+/* ---------- запекание объёма затенения ---------- */
+/** Сетка занятости 0.25 м: 0 — воздух, 1 — бетон/металл/песок, 2 — дерево.
+    Оболочка ангара (стены, кровля) не пишется: рассеянный свет и так
+    приходит сквозь неё (остекление, проёмы). Пол ангара — занят. */
+function buildOccupancy(){
+  const r = 0.25, B = AVOL_BOX;
+  const nx = Math.round(B.sx/r), ny = Math.round(B.sy/r), nz = Math.round(B.sz/r);
+  const occ = new Uint8Array(nx*ny*nz);
+  const g0 = Math.round((0 - B.y0)/r);                     // слои ниже отметки 0 — пол
+  for(let iy=0; iy<g0; iy++) occ.fill(1, iy*nz*nx, (iy+1)*nz*nx);
+  const _p = new THREE.Vector3();
+  /** Бокс с центром c, осями a0..a2 (единичные) и полуразмерами h0..h2. */
+  const box = (c, a0, a1, a2, h0, h1, h2, type)=>{
+    const pad = r*0.5;
+    const ex = Math.abs(a0.x)*h0 + Math.abs(a1.x)*h1 + Math.abs(a2.x)*h2 + pad;
+    const ey = Math.abs(a0.y)*h0 + Math.abs(a1.y)*h1 + Math.abs(a2.y)*h2 + pad;
+    const ez = Math.abs(a0.z)*h0 + Math.abs(a1.z)*h1 + Math.abs(a2.z)*h2 + pad;
+    const ix0 = Math.max(0, Math.floor((c.x-ex-B.x0)/r)), ix1 = Math.min(nx-1, Math.floor((c.x+ex-B.x0)/r));
+    const iy0 = Math.max(0, Math.floor((c.y-ey-B.y0)/r)), iy1 = Math.min(ny-1, Math.floor((c.y+ey-B.y0)/r));
+    const iz0 = Math.max(0, Math.floor((c.z-ez-B.z0)/r)), iz1 = Math.min(nz-1, Math.floor((c.z+ez-B.z0)/r));
+    const H0 = h0 + pad, H1 = h1 + pad, H2 = h2 + pad;
+    for(let iy=iy0; iy<=iy1; iy++){
+      const py = B.y0 + (iy+0.5)*r - c.y;
+      for(let iz=iz0; iz<=iz1; iz++){
+        const pz = B.z0 + (iz+0.5)*r - c.z;
+        let o = (iy*nz + iz)*nx;
+        for(let ix=ix0; ix<=ix1; ix++){
+          const px = B.x0 + (ix+0.5)*r - c.x;
+          if(Math.abs(px*a0.x + py*a0.y + pz*a0.z) > H0) continue;
+          if(Math.abs(px*a1.x + py*a1.y + pz*a1.z) > H1) continue;
+          if(Math.abs(px*a2.x + py*a2.y + pz*a2.z) > H2) continue;
+          if(occ[o+ix] !== 2) occ[o+ix] = type;
+        }
+      }
+    }
+  };
+  const X = new THREE.Vector3(1,0,0), Y = new THREE.Vector3(0,1,0), Z = new THREE.Vector3(0,0,1);
+  const ax = [new THREE.Vector3(), new THREE.Vector3(), new THREE.Vector3()], q = new THREE.Quaternion();
+  const obb = (cx,cy,cz, hx,hy,hz, qa, type)=>{
+    if(qa){ q.set(qa[0],qa[1],qa[2],qa[3]); ax[0].copy(X).applyQuaternion(q); ax[1].copy(Y).applyQuaternion(q); ax[2].copy(Z).applyQuaternion(q); }
+    else { ax[0].copy(X); ax[1].copy(Y); ax[2].copy(Z); }
+    box(_p.set(cx,cy,cz), ax[0], ax[1], ax[2], hx, hy, hz, type);
+  };
+  for(const c of COLLIDERS){
+    normCollider(c);
+    if(c.playerOnly || c.noPlayer) continue;
+    if(c.y1 <= 0.06) continue;                                          // площадки на полу
+    if(c.x1 > HW-0.02 || c.x0 < -HW+0.02 || c.z1 > HD-0.02 || c.z0 < -HD+0.02) continue;   // оболочка ангара
+    if(c.y0 > EAVE-1.5) continue;                                        // кровля и фермы
+    obb(c.cx, c.cy, c.cz, c.hx, c.hy, c.hz, c.q, c.surf === 'wood' ? 2 : 1);
+  }
+  for(const s of DEST.sheets) box(s.c, s.U, s.V, s.N, s.w/2, s.h/2, Math.max(s.t/2, 0.02), 2);
+  for(const p of DEST.props){ const c = p.col; obb(c.cx, c.cy, c.cz, c.hx, c.hy, c.hz, c.q, p.wood ? 2 : 1); }
+  return { occ, nx, ny, nz, r };
+}
+/** Равномерные направления на сфере (спираль Фибоначчи); нижние — с меньшим весом:
+    свет снизу — это отскок от пола, он слабее неба и остекления. */
+function sphereDirs(n, lowW){
+  const out = [], ga = Math.PI*(3 - Math.sqrt(5));
+  for(let i=0;i<n;i++){
+    const y = 1 - (i + 0.5)/n*2, rr = Math.sqrt(1 - y*y), a = i*ga;
+    out.push([Math.cos(a)*rr, y, Math.sin(a)*rr, y < 0 ? lowW : 1]);
+  }
+  return out;
+}
+/** Трассировка по сетке занятости. Возвращает [открыто, доля дерева] (0..1, взвешено). */
+function traceVolume(O, res, maxD, dirs, withWood){
+  const B = AVOL_BOX, r = O.r, nx = O.nx, ny = O.ny, nz = O.nz, occ = O.occ;
+  const gx = Math.round(B.sx/res), gy = Math.round(B.sy/res), gz = Math.round(B.sz/res);
+  const open = new Float32Array(gx*gy*gz), wood = withWood ? new Float32Array(gx*gy*gz) : null, inside = new Uint8Array(gx*gy*gz);
+  const steps = Math.ceil(maxD/r), inv = 1/r;
+  let wsum = 0; for(const d of dirs) wsum += d[3];
+  const D = dirs.map(d=> [d[0]*r*inv, d[1]*r*inv, d[2]*r*inv, d[3]/wsum]);   // шаг в ячейках сетки занятости
+  for(let iy=0; iy<gy; iy++) for(let iz=0; iz<gz; iz++) for(let ix=0; ix<gx; ix++){
+    const k = (iy*gz + iz)*gx + ix;
+    // центр ячейки объёма в координатах сетки занятости
+    const cx = (ix + 0.5)*res*inv, cy = (iy + 0.5)*res*inv, cz = (iz + 0.5)*res*inv;
+    const ci = ((cy|0)*nz + (cz|0))*nx + (cx|0);
+    if(occ[ci]){ inside[k] = 1; continue; }
+    let op = 0, wd = 0;
+    for(const d of D){
+      let x = cx, y = cy, z = cz, hit = 0;
+      for(let s=0; s<steps; s++){
+        x += d[0]; y += d[1]; z += d[2];
+        if(y >= ny || x < 0 || z < 0 || x >= nx || z >= nz) break;
+        if(y < 0){ hit = 1; break; }
+        const v = occ[((y|0)*nz + (z|0))*nx + (x|0)];
+        if(v){ hit = v; break; }
+      }
+      if(!hit) op += d[3]; else if(hit === 2) wd += d[3];
+    }
+    open[k] = op; if(wood) wood[k] = wd;
+  }
+  // ячейки внутри твёрдого берут среднее соседей: иначе трилинейная выборка
+  // у самой стены подмешивает «чёрное» изнутри неё
+  for(let pass=0; pass<2; pass++) for(let iy=0; iy<gy; iy++) for(let iz=0; iz<gz; iz++) for(let ix=0; ix<gx; ix++){
+    const k = (iy*gz + iz)*gx + ix; if(inside[k] !== 1) continue;
+    let so = 0, sw = 0, n = 0;
+    for(const [dx,dy,dz] of [[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]]){
+      const X = ix+dx, Y = iy+dy, Z = iz+dz;
+      if(X<0||Y<0||Z<0||X>=gx||Y>=gy||Z>=gz) continue;
+      const j = (Y*gz + Z)*gx + X; if(inside[j] === 1) continue;
+      so += open[j]; if(wood) sw += wood[j]; n++;
+    }
+    if(n){ open[k] = so/n; if(wood) wood[k] = sw/n; inside[k] = 2; }
+  }
+  return { open, wood, gx, gy, gz };
+}
+/** Сколько открыто у точки над пустым полом на высоте h — эталон «ничем не затенено». */
+function openReference(h, maxD, dirs){
+  let wsum = 0, op = 0;
+  for(const d of dirs){ wsum += d[3]; if(!(d[1] < 0 && h/(-d[1]) <= maxD)) op += d[3]; }
+  return op/wsum;
+}
+const AVOL_VER = 'avol-v1';
+async function buildAmbientVolume(){
+  const key = AVOL_VER + '|' + COLLIDERS.length + '|' + DEST.sheets.length + '|' + DEST.props.length;
+  let L = null, S = null, dims = null;
+  if(TEXCACHE.db){
+    try{
+      const v = await idbReq(TEXCACHE.db.transaction('tex', 'readonly').objectStore('tex').get('AVOL|' + key));
+      if(v){ L = v.L; S = v.S; dims = v.dims; }
+    }catch(e){}
+  }
+  if(!L){
+    const O = buildOccupancy();
+    const dL = sphereDirs(Q.tex >= 0.75 ? 40 : 28, 0.45), dS = sphereDirs(Q.tex >= 0.75 ? 26 : 18, 0.6);
+    const vL = traceVolume(O, 1.0, 9, dL, true), vS = traceVolume(O, 0.5, 1.5, dS, false);
+    // нормировка: открытая площадка ангара — 1 (эталон — точка над полом на высоте выборки)
+    const refL = openReference(1.05, 9, dL), refS = openReference(0.55, 1.5, dS);
+    L = new Uint8Array(vL.open.length*2);
+    for(let i=0;i<vL.open.length;i++){
+      L[i*2]   = Math.round(clamp(vL.open[i]/refL, 0, 1)*255);
+      L[i*2+1] = Math.round(clamp(vL.wood[i]*1.6, 0, 1)*255);
+    }
+    S = new Uint8Array(vS.open.length);
+    for(let i=0;i<vS.open.length;i++) S[i] = Math.round(clamp(Math.pow(vS.open[i]/refS, 1.3), 0, 1)*255);
+    dims = [vL.gx, vL.gy, vL.gz, vS.gx, vS.gy, vS.gz];
+    if(TEXCACHE.db){
+      try{ TEXCACHE.db.transaction('tex', 'readwrite').objectStore('tex').put({L, S, dims}, 'AVOL|' + key); }catch(e){}
+    }
+  }
+  const tL = new THREE.Data3DTexture(L, dims[0], dims[1], dims[2]);
+  tL.format = THREE.RGFormat;
+  const tS = new THREE.Data3DTexture(S, dims[3], dims[4], dims[5]);
+  tS.format = THREE.RedFormat;
+  for(const t of [tL, tS]){
+    t.type = THREE.UnsignedByteType; t.minFilter = t.magFilter = THREE.LinearFilter;
+    t.wrapS = t.wrapT = t.wrapR = THREE.ClampToEdgeWrapping; t.unpackAlignment = 1; t.generateMipmaps = false;
+    t.needsUpdate = true;
+  }
+  // до первой компиляции материалов: каждый материал получает свою ссылку на эти текстуры
+  AVOL_U.uAVolL.value = tL; AVOL_U.uAVolS.value = tS;
+  AVOL.L = L; AVOL.S = S; AVOL.dims = dims;
+  return AVOL;
+}
+const AVOL = { L:null, S:null, dims:null };
+/** Открытость в точке (для частиц и звука): 0 — глухая комната, 1 — ангар. */
+function avolOpen(p){
+  if(!AVOL.L) return 1;
+  const [gx, gy, gz] = AVOL.dims, B = AVOL_BOX;
+  const ix = clamp(Math.floor(p.x - B.x0), 0, gx-1), iy = clamp(Math.floor(p.y - B.y0), 0, gy-1), iz = clamp(Math.floor(p.z - B.z0), 0, gz-1);
+  return AVOL.L[((iy*gz + iz)*gx + ix)*2]/255;
 }
 function collectGlass(){
   const out = [];
@@ -8447,6 +9227,7 @@ function step(dt){
   tickTimers(dt);
   updateWind(t);
   updateDoors(dt);
+  updateWaves(dt);
   if(PH.ready) stepPhysics(dt, WIND.vec);
   updatePlayer(dt, t);
   updateSupply(dt);
@@ -8464,6 +9245,8 @@ function step(dt){
   }
   // сутки длятся минуты: пересчёт всего освещения 10 раз в секунду незаметен
   if(!DAY.paused){ DAY.t = DAY.t + dt*DAY.speed; _dayAcc += dt; if(_dayAcc >= 0.1){ _dayAcc = 0; applyDaylight(DAY.t); } }
+  // освещение в отражениях догоняет время суток (≈ раз в 30 с при 5-минутных сутках)
+  if(ENVCAP.lastT >= 0 && Math.abs(((DAY.t - ENVCAP.lastT + 1.5) % 1) - 0.5) > 0.1) captureEnvironment();
   shaftMat.uniforms.uTime.value = t;
   winShaftMat.uniforms.uTime.value = t;
   const dust = getDust(); if(dust) dust.material.uniforms.uTime.value = t;
@@ -8876,6 +9659,7 @@ function api(stats){
   return {
     THREE, scene, camera, renderer, PH, DEST, FIRES, PL, WPN, TEAMS, COLLIDERS, stats, keys, INPUT, DOORS, PITS, DYNRES, M,
     DOOR_LEAVES, AMMO_BOXES, SUPPLY, SET, EXPO, useDoor, trySupply, lookDoor, openMenu, closeMenu, STATE,
+    AVOL, AVOL_U, FOG_U, avolOpen, FXS, PFX_U, getPasses,
     burn:(s=1)=> ignitePlayer(PL.eye, 1, s),
     step:(dt=1/60, n=1)=>{ for(let i=0;i<n;i++) step(dt); },
     render:()=> getComposer().render(),
