@@ -6741,7 +6741,7 @@ function gratingMaps(size = 256) {
   return { albedo: c, height: h };
 }
 var TEXCACHE = {
-  ver: "tex-v2",
+  ver: "tex-v3",
   db: null,
   shapes: /* @__PURE__ */ new Map(),
   bmp: /* @__PURE__ */ new Map(),
@@ -9691,7 +9691,7 @@ var Particles = class {
         float c = cos(vRot), s = sin(vRot);
         vec2 nn = t.rg*2.0 - 1.0; nn = vec2(c*nn.x - s*nn.y, s*nn.x + c*nn.y);
         vec2 q = vUv*2.0 - 1.0;   q = vec2(c*q.x - s*q.y, s*q.x + c*q.y);
-        vec3 nV = normalize(vec3(nn*1.2 + q*0.35, 0.9));
+        vec3 nV = normalize(vec3(nn*0.9 + q*0.15, 1.0));
         vec3 nW = normalize((vec4(nV, 0.0)*viewMatrix).xyz);
         float sunL = clamp(dot(nW, uSunDir)*0.6 + 0.4, 0.0, 1.0);
         float sky = clamp(nW.y*0.5 + 0.5, 0.0, 1.0);
@@ -9939,9 +9939,10 @@ function smokeAtlas(S) {
         const q = ((u - bx) ** 2 + (v - by) ** 2) / (br * br);
         den += Math.exp(-q * 1.6);
       }
-      den *= 0.45 + 0.75 * fbm(u * 2.4 + f * 3.1, v * 2.4 + f * 1.7);
-      den *= Math.pow(smoothstepJS(1, 0.25, Math.hypot(u, v)), 1.4);
-      D2[py * S + px] = clamp(den, 0, 1.3);
+      den *= 0.25 + 1 * fbm(u * 2.2 + f * 3.1, v * 2.2 + f * 1.7);
+      den = smoothstepJS(0.12, 0.95, den);
+      den *= Math.pow(smoothstepJS(1, 0.15, Math.hypot(u, v)), 1.2);
+      D2[py * S + px] = clamp(den, 0, 1);
     }
     for (let py = 0; py < S; py++) for (let px = 0; px < S; px++) {
       const at = (xx, yy) => D2[clamp(yy, 0, S - 1) * S + clamp(xx, 0, S - 1)];
@@ -9951,7 +9952,7 @@ function smokeAtlas(S) {
       d[i] = Math.round(clamp(0.5 - gx * 1.6, 0, 1) * 255);
       d[i + 1] = Math.round(clamp(0.5 + gy * 1.6, 0, 1) * 255);
       d[i + 2] = Math.round(clamp(den, 0, 1) * 255);
-      d[i + 3] = Math.round(clamp(Math.pow(den, 1.5) * 0.95, 0, 1) * 255);
+      d[i + 3] = Math.round(clamp(Math.pow(den, 1.3) * 0.9, 0, 1) * 255);
     }
   }
   x.putImageData(img, 0, 0);
@@ -14317,14 +14318,14 @@ function emit(f, dt, t) {
       p: _fpe,
       v: _fve.set(rnd(-0.2, 0.2), rnd(0.9, 1.6) * (0.7 + 0.5 * I), rnd(-0.2, 0.2)),
       life: rnd(9, 15),
-      s0: 0.45 + 0.5 * I,
-      s1: rnd(2.6, 4.2) * (1 + 0.4 * big) * (indoor ? 0.8 : 1),
+      s0: 0.7 + 0.6 * I,
+      s1: rnd(3.2, 5) * (1 + 0.4 * big) * (indoor ? 0.8 : 1),
       rot: rnd(0, 6.28),
       spin: rnd(-0.12, 0.12),
       col: [g * 1.06, g * w, g * w * 0.9],
-      a0: lerp(0.38, 0.82, soot),
+      a0: lerp(0.3, 0.62, soot),
       a1: 0,
-      aPow: 1.7,
+      aPow: 1.5,
       drag: 0.35,
       g: 0.35,
       turb: 0.3,

@@ -1247,7 +1247,7 @@ function gratingMaps(size=256){
    случайных чисел сохраняется вместе с результатом, чтобы расстановка карты
    не зависела от того, была текстура в кэше или нет. ?nocache — без кэша.
 --------------------------------------------------------------------------- */
-const TEXCACHE = { ver:'tex-v2', db:null, shapes:new Map(), bmp:new Map(), save:[], hits:0, misses:0,
+const TEXCACHE = { ver:'tex-v3', db:null, shapes:new Map(), bmp:new Map(), save:[], hits:0, misses:0,
   on: !DEBUG.has('nocache') && typeof indexedDB !== 'undefined' && typeof createImageBitmap === 'function' };
 const idbReq = r => new Promise((res, rej)=>{ r.onsuccess = ()=> res(r.result); r.onerror = ()=> rej(r.error); });
 async function texCacheOpen(){
@@ -3729,7 +3729,7 @@ class Particles {
         float c = cos(vRot), s = sin(vRot);
         vec2 nn = t.rg*2.0 - 1.0; nn = vec2(c*nn.x - s*nn.y, s*nn.x + c*nn.y);
         vec2 q = vUv*2.0 - 1.0;   q = vec2(c*q.x - s*q.y, s*q.x + c*q.y);
-        vec3 nV = normalize(vec3(nn*1.2 + q*0.35, 0.9));
+        vec3 nV = normalize(vec3(nn*0.9 + q*0.15, 1.0));
         vec3 nW = normalize((vec4(nV, 0.0)*viewMatrix).xyz);
         float sunL = clamp(dot(nW, uSunDir)*0.6 + 0.4, 0.0, 1.0);
         float sky = clamp(nW.y*0.5 + 0.5, 0.0, 1.0);
@@ -3906,9 +3906,11 @@ function smokeAtlas(S){
       const u = px/S*2 - 1, v = py/S*2 - 1;
       let den = 0;
       for(const [bx, by, br] of blobs){ const q = ((u-bx)**2 + (v-by)**2)/(br*br); den += Math.exp(-q*1.6); }
-      den *= 0.45 + 0.75*fbm(u*2.4 + f*3.1, v*2.4 + f*1.7);
-      den *= Math.pow(smoothstepJS(1.0, 0.25, Math.hypot(u, v)), 1.4);
-      D[py*S + px] = clamp(den, 0, 1.3);
+      // клочья, а не диск: шум «выедает» края, плотность — пороговая, как у облака
+      den *= 0.25 + 1.0*fbm(u*2.2 + f*3.1, v*2.2 + f*1.7);
+      den = smoothstepJS(0.12, 0.95, den);
+      den *= Math.pow(smoothstepJS(1.0, 0.15, Math.hypot(u, v)), 1.2);
+      D[py*S + px] = clamp(den, 0, 1);
     }
     for(let py=0; py<S; py++) for(let px=0; px<S; px++){
       const at = (xx, yy)=> D[clamp(yy, 0, S-1)*S + clamp(xx, 0, S-1)];
@@ -3918,7 +3920,7 @@ function smokeAtlas(S){
       d[i]   = Math.round(clamp(0.5 - gx*1.6, 0, 1)*255);
       d[i+1] = Math.round(clamp(0.5 + gy*1.6, 0, 1)*255);       // canvas y вниз, в шейдере — вверх
       d[i+2] = Math.round(clamp(den, 0, 1)*255);
-      d[i+3] = Math.round(clamp(Math.pow(den, 1.5)*0.95, 0, 1)*255);
+      d[i+3] = Math.round(clamp(Math.pow(den, 1.3)*0.9, 0, 1)*255);
     }
   }
   x.putImageData(img, 0, 0);
@@ -7141,8 +7143,8 @@ function emit(f, dt, t){
     const g = lerp(0.3, 0.045, soot)*rnd(0.85, 1.15), w = rnd(0.9, 0.97);
     const indoor = f.ceil < 6;
     FXS.smoke.spawn({p:_fpe, v:_fve.set(rnd(-0.2,0.2), rnd(0.9,1.6)*(0.7 + 0.5*I), rnd(-0.2,0.2)), life:rnd(9,15),
-      s0:0.45 + 0.5*I, s1:rnd(2.6,4.2)*(1 + 0.4*big)*(indoor ? 0.8 : 1), rot:rnd(0,6.28), spin:rnd(-0.12,0.12),
-      col:[g*1.06, g*w, g*w*0.9], a0:lerp(0.38, 0.82, soot), a1:0, aPow:1.7, drag:0.35, g:0.35, turb:0.3, fadeIn:0.5,
+      s0:0.7 + 0.6*I, s1:rnd(3.2,5.0)*(1 + 0.4*big)*(indoor ? 0.8 : 1), rot:rnd(0,6.28), spin:rnd(-0.12,0.12),
+      col:[g*1.06, g*w, g*w*0.9], a0:lerp(0.3, 0.62, soot), a1:0, aPow:1.5, drag:0.35, g:0.35, turb:0.3, fadeIn:0.5,
       heat:0.6 + 0.6*I, ceil:f.ceil, wind: indoor ? 0.004 : 0.014});
   }
   if(Math.random() < (I*6 + big*8)*dt){
