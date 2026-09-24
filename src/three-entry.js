@@ -9,4 +9,5 @@ import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
 import { SMAAPass } from 'three/addons/postprocessing/SMAAPass.js';
 import { GTAOPass } from 'three/addons/postprocessing/GTAOPass.js';
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
-export { THREE, BGU, EffectComposer, RenderPass, UnrealBloomPass, ShaderPass, SMAAPass, GTAOPass, OutputPass };
+import { Pass } from 'three/addons/postprocessing/Pass.js';
+export { THREE, BGU, EffectComposer, RenderPass, UnrealBloomPass, ShaderPass, SMAAPass, GTAOPass, OutputPass, Pass };

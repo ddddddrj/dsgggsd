@@ -14,9 +14,11 @@ import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
 import { SMAAPass } from 'three/addons/postprocessing/SMAAPass.js';
 import { GTAOPass } from 'three/addons/postprocessing/GTAOPass.js';
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import { Pass } from 'three/addons/postprocessing/Pass.js';
 
 // Ядро: утилиты, профиль качества, рендерер, сцена, камера, небо, окружение.
 const $ = s => document.querySelector(s);
+window.__angarBoot = true;
 const clamp = (v,a,b)=> v<a?a:(v>b?b:v);
 const lerp = (a,b,t)=> a+(b-a)*t;
 const smoothstep = (a,b,x)=>{ const t=clamp((x-a)/(b-a),0,1); return t*t*(3-2*t); };
@@ -24,6 +26,20 @@ let SEED = 20260920;
 const srnd = ()=>{ SEED = (SEED*1664525 + 1013904223) >>> 0; return SEED/4294967296; };
 const sr = (a,b)=> a + srnd()*(b-a);
 const si = (a,b)=> Math.floor(sr(a,b+1));
+// Второй генератор — для добавленных эффектов и дверей: последовательность SEED,
+// по которой расставлена карта, не сдвигается.
+let _seed2 = 424242;
+const rnd2 = ()=>{ _seed2 = (_seed2*1664525 + 1013904223) >>> 0; return _seed2/4294967296; };
+/** Отложенные действия по игровому времени: на паузе они тоже стоят
+    (setTimeout срабатывал бы, пока открыто меню). */
+const TIMERS = [];
+const later = (delay, fn)=>{ TIMERS.push({t: delay, fn}); };
+function tickTimers(dt){
+  for(let i=TIMERS.length-1;i>=0;i--){
+    const tm = TIMERS[i]; tm.t -= dt;
+    if(tm.t <= 0){ TIMERS[i] = TIMERS[TIMERS.length-1]; TIMERS.pop(); tm.fn(); }
+  }
+}
 
 /* ============================================================================
    УРОВНИ КАЧЕСТВА
@@ -83,17 +99,37 @@ const TS = n => Math.max(128, Math.round(n*Q.tex/64)*64);
 /* ============================================================================
    РЕНДЕРЕР
 ============================================================================ */
-const renderer = new THREE.WebGLRenderer({antialias:false, powerPreference:'high-performance', stencil:false});
+/** Ошибка загрузки: вместо бесконечной «Загрузки…» — понятное сообщение. */
+function fatal(title, detail){
+  if(window.__angarFatal) window.__angarFatal(title, detail);
+  const e = new Error(title); e.angarShown = true; return e;
+}
+function createRenderer(){
+  let probe = null;
+  try{ const c = document.createElement('canvas'); probe = c.getContext('webgl2'); }catch(e){}
+  if(!probe) throw fatal('WebGL 2 недоступен',
+    'Браузер не смог создать контекст WebGL 2. Включите аппаратное ускорение (chrome://settings/system), обновите драйвер видеокарты или откройте карту в свежем Chrome / Edge / Firefox.');
+  probe.getExtension('WEBGL_lose_context')?.loseContext();
+  try{ return new THREE.WebGLRenderer({antialias:false, powerPreference:'high-performance', stencil:false}); }
+  catch(e){ throw fatal('Не удалось создать WebGL-контекст', String(e && e.message || e)); }
+}
+const renderer = createRenderer();
 renderer.setPixelRatio(Math.min(devicePixelRatio, Q.pixelRatio));
 renderer.setSize(innerWidth, innerHeight);
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = Q.softShadow ? THREE.PCFSoftShadowMap : THREE.PCFShadowMap;
 // Тень пересчитывается не каждый кадр, а только когда солнце заметно сдвинулось.
 renderer.shadowMap.autoUpdate = false;
-renderer.toneMapping = THREE.ACESFilmicToneMapping;
-renderer.toneMappingExposure = 1.02;
+// AgX мягко сворачивает пересветы (кровля, проёмы) и не заливает тени в ноль,
+// как ACES с последующим контрастом. Выбор меняется в настройках.
+renderer.toneMapping = THREE.AgXToneMapping;
+renderer.toneMappingExposure = 1.0;
 // счётчик вызовов отрисовки — за весь кадр (все проходы), а не за последний проход
 renderer.info.autoReset = false;
+renderer.domElement.addEventListener('webglcontextlost', e=>{
+  e.preventDefault();
+  fatal('Видеокарта сбросила WebGL-контекст', 'Обычно это перегрев или нехватка видеопамяти. Перезагрузите страницу; при повторении выберите ?q=low.');
+});
 document.body.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
@@ -1203,6 +1239,125 @@ function gratingMaps(size=256){
   return {albedo:c, height:h};
 }
 
+/* ---------------------------------------------------------------------------
+   КЭШ ПРОЦЕДУРНЫХ ТЕКСТУР (IndexedDB)
+   Первый запуск рисует текстуры как раньше и в простое сохраняет холсты
+   в IndexedDB (PNG). Следующие запуски берут готовые картинки — генерация
+   (≈2.5 с на low, в разы дольше на high) пропускается. Состояние генераторов
+   случайных чисел сохраняется вместе с результатом, чтобы расстановка карты
+   не зависела от того, была текстура в кэше или нет. ?nocache — без кэша.
+--------------------------------------------------------------------------- */
+const TEXCACHE = { ver:'tex-v2', db:null, shapes:new Map(), bmp:new Map(), save:[], hits:0, misses:0,
+  on: !DEBUG.has('nocache') && typeof indexedDB !== 'undefined' && typeof createImageBitmap === 'function' };
+const idbReq = r => new Promise((res, rej)=>{ r.onsuccess = ()=> res(r.result); r.onerror = ()=> rej(r.error); });
+async function texCacheOpen(){
+  if(!TEXCACHE.on) return;
+  try{
+    const open = indexedDB.open('angar07', 1);
+    open.onupgradeneeded = ()=> open.result.createObjectStore('tex');
+    TEXCACHE.db = await Promise.race([idbReq(open), new Promise((_, rej)=> setTimeout(()=> rej(new Error('idb timeout')), 3000))]);
+    const prefix = TEXCACHE.ver + '|' + QNAME + '|' + TEXK + '|';
+    const st = TEXCACHE.db.transaction('tex', 'readonly').objectStore('tex');
+    const range = IDBKeyRange.bound(prefix, prefix + '\uffff');
+    const [keys, vals] = await Promise.all([idbReq(st.getAllKeys(range)), idbReq(st.getAll(range))]);
+    await Promise.all(keys.map(async (k, i)=>{
+      const key = k.slice(prefix.length), v = vals[i];
+      if(key.startsWith('S:')) TEXCACHE.shapes.set(key.slice(2), v);
+      else { try{ TEXCACHE.bmp.set(key, await createImageBitmap(v)); }catch(e){} }
+    }));
+  }catch(e){ TEXCACHE.db = null; TEXCACHE.on = false; }
+}
+const TEX_PROPS = ['colorSpace','wrapS','wrapT','anisotropy','flipY','mapping','generateMipmaps','minFilter','magFilter'];
+function cacheCanvas(bmp){
+  const [c, x] = cv(bmp.width, bmp.height); x.drawImage(bmp, 0, 0); return c;
+}
+/** Оборачивает генератор: результат (холсты, текстуры, объекты из них) — из кэша или посчитать и запомнить. */
+function texCached(name, fn){
+  return function(...args){
+    if(!TEXCACHE.on) return fn.apply(this, args);
+    const parts = [];
+    for(const a of args){
+      if(a && typeof a === 'object'){ if(!a.__ck) return fn.apply(this, args); parts.push(a.__ck); }
+      else parts.push(String(a));
+    }
+    const key = name + '(' + parts.join(',') + ')';
+    const shape = TEXCACHE.shapes.get(key);
+    if(shape){
+      const out = rebuildCached(key, shape.v);
+      if(out !== undefined){
+        TEXCACHE.hits++;
+        SEED = shape.seed[0]; _fseed = shape.seed[1]; _seed2 = shape.seed[2];
+        return out;
+      }
+    }
+    TEXCACHE.misses++;
+    const res = fn.apply(this, args);
+    const canv = [];
+    const v = describeCached(key, res, canv);
+    if(v) TEXCACHE.save.push({ key, shape:{ v, seed:[SEED, _fseed, _seed2] }, canv });
+    return res;
+  };
+}
+function describeCached(key, o, canv){
+  if(o instanceof HTMLCanvasElement){ const id = key + '#' + canv.length; o.__ck = id; canv.push([id, o]); return {k:'c', id}; }
+  if(o && o.isTexture){
+    if(!(o.image instanceof HTMLCanvasElement)) return null;
+    const id = key + '#' + canv.length; o.image.__ck = id; canv.push([id, o.image]);
+    const p = {}; for(const n of TEX_PROPS) p[n] = o[n];
+    return {k:'t', id, p, r:[o.repeat.x, o.repeat.y], o:[o.offset.x, o.offset.y]};
+  }
+  if(o && typeof o === 'object'){
+    const out = {}; for(const n in o){ const d = describeCached(key, o[n], canv); if(!d) return null; out[n] = d; }
+    return {k:'o', v:out};
+  }
+  return (typeof o === 'number' || typeof o === 'string' || typeof o === 'boolean') ? {k:'v', v:o} : null;
+}
+function rebuildCached(key, d){
+  if(d.k === 'v') return d.v;
+  if(d.k === 'c' || d.k === 't'){
+    const b = TEXCACHE.bmp.get(d.id); if(!b) return undefined;
+    const c = cacheCanvas(b); c.__ck = d.id;
+    if(d.k === 'c') return c;
+    const t = new THREE.CanvasTexture(c);
+    for(const n of TEX_PROPS) if(d.p[n] !== undefined) t[n] = d.p[n];
+    t.repeat.set(d.r[0], d.r[1]); t.offset.set(d.o[0], d.o[1]);
+    return t;
+  }
+  const out = {};
+  for(const n in d.v){ const r = rebuildCached(key, d.v[n]); if(r === undefined) return undefined; out[n] = r; }
+  return out;
+}
+/** Сохранение — после запуска, по одному холсту, чтобы не мешать первым кадрам. */
+async function texCacheFlush(){
+  if(!TEXCACHE.db || !TEXCACHE.save.length) return;
+  const prefix = TEXCACHE.ver + '|' + QNAME + '|' + TEXK + '|';
+  const list = TEXCACHE.save.splice(0);
+  for(const e of list){
+    try{
+      const blobs = [];
+      for(const [id, c] of e.canv){
+        const b = await new Promise(res=> c.toBlob(res, 'image/png'));
+        if(!b) throw new Error('toBlob');
+        blobs.push([id, b]);
+        await new Promise(r=> setTimeout(r, 0));
+      }
+      const tx = TEXCACHE.db.transaction('tex', 'readwrite'), st = tx.objectStore('tex');
+      for(const [id, b] of blobs) st.put(b, prefix + id);
+      st.put(e.shape, prefix + 'S:' + e.key);
+      await new Promise((res, rej)=>{ tx.oncomplete = res; tx.onerror = ()=> rej(tx.error); });
+    }catch(err){ return; }
+  }
+}
+function installTexCache(){
+  osbMaps = texCached('osb', osbMaps); concreteMaps = texCached('conc', concreteMaps); lumberMaps = texCached('lumber', lumberMaps);
+  corrugatedMaps = texCached('corr', corrugatedMaps); steelMaps = texCached('steel', steelMaps); panelMaps = texCached('panel', panelMaps);
+  dirtyGlassMaps = texCached('glass', dirtyGlassMaps); flagTex = texCached('flag', flagTex); helipadTex = texCached('heli', helipadTex);
+  parkingTex = texCached('park', parkingTex); hazardMaps = texCached('hazard', hazardMaps); decalAtlas = texCached('decal', decalAtlas);
+  craterMaps = texCached('crater', craterMaps); gratingMaps = texCached('grating', gratingMaps); floorDamageMaps = texCached('floordmg', floorDamageMaps);
+  teamFlagTex = texCached('teamflag', teamFlagTex); flameAtlas = texCached('flameA', flameAtlas); smokeAtlas = texCached('smokeA', smokeAtlas);
+  heightToNormal = texCached('h2n', heightToNormal); heightToAO = texCached('h2ao', heightToAO);
+}
+
 // Материалы: PBR-материалы из процедурных карт + шейдер обугливания дерева.
 const MAPS = {}, M = {};
 function buildMaterials(){
@@ -1229,7 +1384,9 @@ function buildMaterials(){
   MAPS.conc  = concreteMaps(TS(768));
   MAPS.wood  = lumberMaps(TS(768));
   MAPS.corr  = corrugatedMaps(TS(512), 0.45, [124,118,110], 7);
-  MAPS.roof  = corrugatedMaps(TS(512), 0.62, [168,154,136], 6);
+  // кровля — выветренный оцинкованный профлист: меньше ржавых пятен и не такая яркая,
+  // иначе потолок пестрит сильнее всего остального кадра
+  MAPS.roof  = corrugatedMaps(TS(512), 0.3, [138,137,132], 6);
   MAPS.steel = steelMaps(TS(512), [112,106,98]);
   MAPS.panel = panelMaps(TS(768));
   MAPS.hazard = hazardMaps(256);
@@ -1240,7 +1397,8 @@ function buildMaterials(){
   M.conc  = mk(MAPS.conc, [1,1], 0.80, {rough:1.0, ao:.95, env:.22, aoPower:1.15});
   M.wood  = mk(MAPS.wood, [1,1], 0.5, {rough:1.0, ao:.75, env:.28, hStrength:1.2});
   M.corr  = mk(MAPS.corr, [1,1], 1.20, {rough:1.0, metal:.25, side:THREE.DoubleSide, env:1.0, ao:.6});
-  M.roof  = mk(MAPS.roof, [1,1], 1.15, {rough:1.0, metal:.15, side:THREE.DoubleSide, env:1.0, ao:.55});
+  M.roof  = mk(MAPS.roof, [1,1], 1.15, {rough:1.0, metal:.15, side:THREE.DoubleSide, env:0.6, ao:.55});
+  M.roof.color.setRGB(0.78, 0.78, 0.76);
   M.steel = mk(MAPS.steel,[1,1], 0.95, {rough:1.0, metal:.35, env:1.0, ao:.6});
   M.panel = mk(MAPS.panel,[1,1], 0.95, {rough:1.0, ao:.95, env:.25, aoPower:1.1});
   M.hazard = mk(MAPS.hazard,[1,1], 0.9, {rough:1.0, metal:.28, env:.8, ao:.7});
@@ -1328,6 +1486,7 @@ function makeBurnable(mat){
   mat.userData.burnable = true;
   mat.onBeforeCompile = (sh)=>{
     sh.uniforms.uTime = BURN_U.uTime;
+    sh.uniforms.uGrime = { value: mat.userData.grime ? 1 : 0 };
     sh.vertexShader = sh.vertexShader
       .replace('#include <common>', `#include <common>
         attribute vec2 aBurn; varying vec2 vBurn; varying vec3 vBurnPos;`)
@@ -1335,7 +1494,7 @@ function makeBurnable(mat){
         vBurn = aBurn; vBurnPos = (modelMatrix*vec4(transformed,1.0)).xyz;`);
     sh.fragmentShader = sh.fragmentShader
       .replace('#include <common>', `#include <common>
-        uniform float uTime; varying vec2 vBurn; varying vec3 vBurnPos;
+        uniform float uTime, uGrime; varying vec2 vBurn; varying vec3 vBurnPos;
         float bh(vec3 p){ return fract(sin(dot(p, vec3(12.9898,78.233,45.164)))*43758.5453); }
         float bnoise(vec3 p){ vec3 i=floor(p), f=fract(p); f=f*f*(3.0-2.0*f);
           return mix(mix(mix(bh(i),bh(i+vec3(1,0,0)),f.x), mix(bh(i+vec3(0,1,0)),bh(i+vec3(1,1,0)),f.x),f.y),
@@ -1347,6 +1506,18 @@ function makeBurnable(mat){
             float d=length(g+o-f); if(d<d1){d2=d1;d1=d;} else if(d<d2) d2=d; }
           return d2-d1; }`)
       .replace('#include <map_fragment>', `#include <map_fragment>
+        if(uGrime > 0.5){
+          // обшивка: крупные пятна тона ломают повтор текстуры, у пола — грязь
+          // и брызги, по листам — редкие вертикальные подтёки
+          float gM = bnoise(vBurnPos*0.45)*0.6 + bnoise(vBurnPos*1.7)*0.4;
+          diffuseColor.rgb *= 0.82 + 0.34*gM;
+          float gY = vBurnPos.y < ${(F2 - 0.15).toFixed(3)} ? vBurnPos.y : vBurnPos.y - ${F2.toFixed(3)};
+          float gN = bnoise(vec3(vBurnPos.x*3.1, vBurnPos.y*1.4, vBurnPos.z*3.1));
+          float gGround = 1.0 - smoothstep(0.0, 0.35 + 0.45*gN, gY);
+          float gStreak = smoothstep(0.6, 0.85, bnoise(vec3(vBurnPos.x*7.0, vBurnPos.y*0.22, vBurnPos.z*7.0)))
+                        * smoothstep(0.4, 0.75, bnoise(vBurnPos*0.55 + 3.0));
+          diffuseColor.rgb = mix(diffuseColor.rgb, diffuseColor.rgb*vec3(0.55,0.5,0.44), clamp(gGround*0.8 + gStreak*0.4, 0.0, 0.85));
+        }
         float bN = bnoise(vBurnPos*5.0)*0.6 + bnoise(vBurnPos*17.0)*0.4;
         float bChar = clamp(vBurn.x*1.25 + (bN-0.5)*0.35, 0.0, 1.0);
         float bScorch = smoothstep(0.02, 0.35, bChar);
@@ -1375,10 +1546,11 @@ const FX = {};
 function buildExtraMaterials(){
   M.osb.color.setRGB(0.9, 0.86, 0.8); M.osb2.color.setRGB(0.84, 0.8, 0.74); M.wood.color.setRGB(0.82, 0.76, 0.68);
   for(const m of [M.osb, M.osb2, M.wood]){ m.envMapIntensity = 0.12; }
+  M.osb.userData.grime = M.osb2.userData.grime = true;
   makeBurnable(M.osb); makeBurnable(M.osb2); makeBurnable(M.wood);
   // брус и фанера под покраску для укрытий: та же древесина, свой тон
   M.woodDark = makeBurnable(M.wood.clone()); M.woodDark.color = new THREE.Color(0x8a7a62);
-  M.plywood  = makeBurnable(M.osb.clone());  M.plywood.color  = new THREE.Color(0xc9b793);
+  M.plywood  = makeBurnable(M.osb.clone());  M.plywood.color  = new THREE.Color(0xc9b793); M.plywood.userData.grime = true;
 
   M.flagAlpha = new THREE.MeshStandardMaterial({ map: teamFlagTex('ALPHA', TS(1024), TS(640)),
     roughness:.9, side:THREE.DoubleSide, alphaTest:0.4 });
@@ -1418,6 +1590,8 @@ function buildExtraMaterials(){
   FX.flame = flameTex(128);
   FX.smoke = smokeTex(128);
   FX.glow  = glowTex(64);
+  FX.flameAtlas = flameAtlas(Q.tex >= 0.75 ? 128 : 64);
+  FX.smokeAtlas = smokeAtlas(Q.tex >= 0.75 ? 128 : 96);
 }
 function buildAllMaterials(){ buildMaterials(); buildExtraMaterials(); }
 
@@ -1527,7 +1701,47 @@ function beamBetween(mat, a, b, w, h, o={}){
 --------------------------------------------------------------------------- */
 // Крупная ячейка: вызов отрисовки дороже лишних вершин за кадром, особенно
 // на слабых машинах, где WebGL упирается в процессор, а не в видеокарту.
-const BAKE_CELL = 30;
+const BAKE_CELL = 60;
+/* ---------------------------------------------------------------------------
+   ПАЛИТРА: простые цветные материалы (без текстур, прозрачности и свечения)
+   с одинаковыми шероховатостью/металличностью сливаются в один материал,
+   а их цвет уходит в цвет вершин. Сотня cmat(...) превращается в десяток
+   материалов, и реквизит разных цветов рисуется одним вызовом.
+--------------------------------------------------------------------------- */
+const PALETTE = new Map();
+function isPlainMat(m){
+  return m && m.type === 'MeshStandardMaterial' && !m.map && !m.normalMap && !m.roughnessMap && !m.metalnessMap &&
+    !m.aoMap && !m.emissiveMap && !m.alphaMap && !m.transparent && !(m.alphaTest > 0) && m.emissive.getHex() === 0 &&
+    !m.userData.burnable && !m.userData.noPalette;
+}
+function paletteMat(m){
+  // грубые ступени: разница в 0.05 шероховатости на глаз не видна, а материалов втрое меньше
+  const rq = Math.round(m.roughness*6)/6, mq = m.metalness < 0.15 ? 0.05 : (m.metalness < 0.6 ? 0.35 : 0.85);
+  const key = [rq.toFixed(2), mq, m.side].join('|');
+  let pm = PALETTE.get(key);
+  if(!pm){
+    pm = new THREE.MeshStandardMaterial({ color:0xffffff, roughness:rq, metalness:mq,
+      envMapIntensity: mq > 0.5 ? 1.2 : 0.9, side:m.side, vertexColors:true });
+    pm.name = 'palette:' + key; PALETTE.set(key, pm);
+  }
+  return pm;
+}
+function toPalette(e){
+  if(!isPlainMat(e.mat)) return;
+  const g = e.geo, n = g.attributes.position.count, c = e.mat.color;
+  const src = g.attributes.color, col = new Float32Array(n*3);
+  for(let i=0;i<n;i++){
+    const r = src ? src.getX(i) : 1, gg = src ? src.getY(i) : 1, b = src ? src.getZ(i) : 1;
+    col[i*3] = r*c.r; col[i*3+1] = gg*c.g; col[i*3+2] = b*c.b;
+  }
+  g.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  e.mat = paletteMat(e.mat);
+}
+/** Тени статики: всё неразрушаемое, что отбрасывает тень, сливается в одну
+    копию только из позиций (слой LAYER_SHADOW — её видит лишь камера тени).
+    Мелочь меньше SMALL_CASTER тени не даёт вовсе. */
+const SHADOW_SRC = { front:[], double:[] };
+const SMALL_CASTER = 0.22;
 const KEEP = new Set(['position','normal','uv','color','aBurn']);
 function unifyIndexing(list){
   if(!list.some(g=>!g.index)) return list;
@@ -1549,6 +1763,10 @@ function normalizeAttrs(list, withColor, withBurn){
   }
 }
 function bakeGroups(entries, tag){
+  for(const e of entries){
+    toPalette(e);
+    if(e.cast){ e.geo.computeBoundingSphere(); if(e.geo.boundingSphere.radius < SMALL_CASTER && !(e.geo.userData && e.geo.userData.onBaked)) e.cast = false; }
+  }
   const needColor = new Set();
   for(const e of entries) if(e.geo.attributes.color) needColor.add(e.mat.uuid);
   const cells = new Map();
@@ -1557,7 +1775,8 @@ function bakeGroups(entries, tag){
     e.geo.computeBoundingSphere();
     _c.copy(e.geo.boundingSphere.center);
     const grp = (e.geo.userData && e.geo.userData.group) || '';
-    const key = e.mat.uuid+'|'+Math.floor(_c.x/BAKE_CELL)+'|'+Math.floor(_c.z/BAKE_CELL)
+    // две половины ангара (запад/восток): меньше вызовов, но отсечение по взгляду остаётся
+    const key = e.mat.uuid+'|'+Math.floor(_c.x/BAKE_CELL)+'|'+Math.floor((_c.z + 45)/90)
               +'|'+(e.cast?1:0)+(e.recv?1:0)+'|'+(e.order||0)+'|'+grp;
     let c = cells.get(key);
     if(!c){ c = {mat:e.mat, cast:e.cast, recv:e.recv, order:e.order||0, list:[]}; cells.set(key,c); }
@@ -1584,9 +1803,33 @@ function bakeGroups(entries, tag){
     mesh.renderOrder = c.order; mesh.name = tag;
     mesh.matrixAutoUpdate = false; mesh.updateMatrix();
     scene.add(mesh); made++;
+    // неразрушаемое (нет диапазонов для обрушения) и без альфа-среза — в общую тень
+    if(c.cast && !hooks.length && !c.mat.alphaMap && !(c.mat.alphaTest > 0) && !c.mat.transparent){
+      const pg = new THREE.BufferGeometry();
+      pg.setAttribute('position', merged.attributes.position);
+      if(merged.index) pg.setIndex(merged.index);
+      (c.mat.side === THREE.FrontSide ? SHADOW_SRC.front : SHADOW_SRC.double).push(pg);
+      mesh.castShadow = false;
+    }
     for(const [fn, start, count] of hooks) fn(mesh, start, count);
   }
   return made;
+}
+function buildShadowProxy(){
+  let n = 0;
+  for(const [list, side] of [[SHADOW_SRC.front, THREE.FrontSide], [SHADOW_SRC.double, THREE.DoubleSide]]){
+    if(!list.length) continue;
+    const idx = list.every(g=> g.index);
+    const geo = BGU.mergeGeometries(idx ? list : list.map(g=> g.index ? g.toNonIndexed() : g), false);
+    list.length = 0;
+    if(!geo) continue;
+    const m = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ side, colorWrite:false }));
+    m.name = 'baked_shadow'; m.castShadow = true; m.receiveShadow = false; m.frustumCulled = false;
+    m.matrixAutoUpdate = false; m.userData.nomerge = true; m.layers.set(LAYER_SHADOW);
+    scene.add(m); n++;
+  }
+  sun.shadow.camera.layers.enable(LAYER_SHADOW);
+  return n;
 }
 function flushBuckets(){
   const entries = [];
@@ -2877,7 +3120,8 @@ function applyDaylight(t){
   scene.background = k.fogCol;
   // отражения окружения держим умеренными: днём свет ровный, без блеска
   scene.environmentIntensity = lerp(0.5, 0.08, nightK);
-  renderer.toneMappingExposure = k.exp * 0.9;
+  EXPO.base = k.exp * 0.9;
+  renderer.toneMappingExposure = EXPO.base * SET.exp * EXPO.eye;
 
   // Стёкла темнеют к ночи, но подсвечиваются изнутри, когда горят фонари.
   M.glass.color.copy(k.skyMid).lerp(_kc.setHex(0xc4cfd6), 1-nightK*0.86);
@@ -2966,7 +3210,30 @@ const GradeShader = {
       gl_FragColor = vec4(col, c.a);
     }`
 };
-let composer, bloomPass, gradePass, smaaPass, aoPass;
+/** Слои: 0 — мир; LAYER_VM — оружие в руках и огонь на одежде (свой проход
+    с очисткой глубины: ствол не лезет в стены и не попадает в AO); LAYER_FX —
+    прозрачное без записи глубины (частицы, лучи, декали): его не видит проход
+    нормалей AO; LAYER_SHADOW — упрощённые копии статики только для карты теней. */
+const LAYER_VM = 1, LAYER_FX = 2, LAYER_SHADOW = 3;
+camera.layers.enable(LAYER_FX);
+class ViewmodelPass extends Pass {
+  constructor(){ super(); this.needsSwap = false; }
+  render(r, writeBuffer, readBuffer){
+    const auto = r.autoClear, bg = scene.background, mask = camera.layers.mask;
+    r.autoClear = false; scene.background = null; camera.layers.set(LAYER_VM);
+    r.setRenderTarget(this.renderToScreen ? null : readBuffer);
+    r.clearDepth();
+    r.render(scene, camera);
+    r.autoClear = auto; scene.background = bg; camera.layers.mask = mask;
+  }
+}
+/** Всё прозрачное без записи глубины уходит в слой FX (один обход после сборки,
+    дальше новые эффекты помечаются при создании). */
+function fxLayer(o){
+  o.traverse(m=>{ if(m.isMesh && m.material && !Array.isArray(m.material) && m.material.transparent && m.material.depthWrite === false) m.layers.set(LAYER_FX); });
+  return o;
+}
+let composer, bloomPass, gradePass, smaaPass, aoPass, vmPass;
 function buildComposer(){
   composer = new EffectComposer(renderer);
   composer.addPass(new RenderPass(scene, camera));
@@ -2983,28 +3250,30 @@ function buildComposer(){
     aoPass.updatePdMaterial({ lumaPhi: 8, depthPhi: 2.2, normalPhi: 3.6, radius: 4, samples: 8 });
     aoPass.blendIntensity = 1.0;
     // В проход глубины/нормалей AO не пускаем прозрачное без записи глубины:
-    // столбы света, частицы, декали, пламя перед камерой. Иначе AO считает
-    // их твёрдой геометрией и чернит всё позади (лучи, горящий игрок).
-    const ov = aoPass.overrideVisibility.bind(aoPass);
-    aoPass.overrideVisibility = function(){
-      ov();
-      this.scene.traverse(o=>{ if(o.isMesh && o.visible && o.material && o.material.transparent && o.material.depthWrite === false) o.visible = false; });
-    };
+    // столбы света, частицы, декали, пламя перед камерой. Раньше для этого
+    // каждый кадр обходилась вся сцена; теперь достаточно выключить слой FX.
+    aoPass.overrideVisibility = function(){ this._mask = camera.layers.mask; camera.layers.disable(LAYER_FX); };
+    aoPass.restoreVisibility = function(){ camera.layers.mask = this._mask; };
     composer.addPass(aoPass);
   }
+  vmPass = new ViewmodelPass();
+  composer.addPass(vmPass);
   if(Q.bloom){
     // Ночью ореол вокруг ламп — главный носитель настроения, поэтому
     // порог ниже дневного и подстраивается в applyDaylight.
     bloomPass = new UnrealBloomPass(new THREE.Vector2(innerWidth,innerHeight), 0.28, 0.85, 0.98);
     composer.addPass(bloomPass);
   }
+  // Тонмаппинг и перевод в sRGB — до грейдинга: кривая контраста и тонировка
+  // работают с экранными значениями 0..1. Раньше контраст применялся к
+  // линейному HDR и обрезал всё тёмное в ноль (почти чёрные стены дома).
+  composer.addPass(new OutputPass());
   gradePass = new ShaderPass(GradeShader);
   composer.addPass(gradePass);
   if(Q.smaa){
     smaaPass = new SMAAPass(innerWidth*renderer.getPixelRatio(), innerHeight*renderer.getPixelRatio());
     composer.addPass(smaaPass);
   }
-  composer.addPass(new OutputPass());
 }
 
 const DAY = {
@@ -3039,7 +3308,7 @@ async function initPhysics(){
   // ammo.wasm.js подключён классическим <script>: он объявляет глобальную фабрику Ammo.
   // Бинарник Bullet (wasm) вшит в этот же HTML как base64 — внешних файлов нет
   const b64 = document.getElementById('ammo-wasm').textContent.trim();
-  const bin = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+  const bin = await decodeBase64(b64);
   A = PH.A = await window.Ammo({ wasmBinary: bin });
   const cc = new A.btSoftBodyRigidBodyCollisionConfiguration();
   const disp = new A.btCollisionDispatcher(cc);
@@ -3057,6 +3326,20 @@ async function initPhysics(){
   PH.ready = true;
 }
 
+/** base64 → байты без atob и посимвольного Uint8Array.from (0.75 МБ wasm
+    так разбирались сотни миллисекунд и лишние мегабайты строк). */
+async function decodeBase64(b64){
+  if(typeof Uint8Array.fromBase64 === 'function') return Uint8Array.fromBase64(b64);
+  try{ const r = await fetch('data:application/octet-stream;base64,' + b64); return new Uint8Array(await r.arrayBuffer()); }catch(e){}
+  const T = new Uint8Array(128), ABC = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+  for(let i=0;i<64;i++) T[ABC.charCodeAt(i)] = i;
+  const n = b64.length, pad = b64.endsWith('==') ? 2 : (b64.endsWith('=') ? 1 : 0), out = new Uint8Array(n/4*3 - pad);
+  for(let i=0, j=0; i<n; i+=4){
+    const v = T[b64.charCodeAt(i)]<<18 | T[b64.charCodeAt(i+1)]<<12 | T[b64.charCodeAt(i+2)]<<6 | T[b64.charCodeAt(i+3)];
+    out[j++] = v>>16; if(j < out.length) out[j++] = (v>>8) & 255; if(j < out.length) out[j++] = v & 255;
+  }
+  return out;
+}
 /* ---------- формы и тела ---------- */
 function boxShape(hx,hy,hz){
   const s = new A.btBoxShape(new A.btVector3(hx,hy,hz));
@@ -3339,11 +3622,13 @@ function pokeCloth(p, R, power){
 }
 
 /* ---------- шаг ---------- */
-new THREE.Quaternion();
+const _contactP = new THREE.Vector3();
 function stepPhysics(dt, wind){
   if(!PH.ready) return;
   for(const rec of PH.soft) rec._X = windOnCloth(rec, wind, rec.push);
-  world.stepSimulation(dt, 4, 1/90);
+  // кадр ограничен 0.05 с: 6 подшагов по 1/90 покрывают его целиком (4 давали 0.044 с —
+  // при просадках FPS время физики терялось и всё замедлялось)
+  world.stepSimulation(dt, 6, 1/90);
   // синхронизация мешей
   for(let i=PH.dyn.length-1;i>=0;i--){
     const r = PH.dyn[i];
@@ -3385,7 +3670,7 @@ function stepPhysics(dt, wind){
         if(imp > best){ best = imp; bp = cp.get_m_positionWorldOnA(); } }
       if(best > 0.25 && bp && (!dyn._lastHit || dyn.age - dyn._lastHit > 0.15)){
         dyn._lastHit = dyn.age;
-        PH.onContact(new THREE.Vector3(bp.x(),bp.y(),bp.z()), best, dyn);
+        PH.onContact(_contactP.set(bp.x(),bp.y(),bp.z()), best, dyn);
         fired++;
       }
     }
@@ -3407,96 +3692,238 @@ const QUAD = (()=>{
   g.setIndex([0,1,2, 0,2,3]);
   return g;
 })();
-const FXU = { uAmb:{value:new THREE.Color(1,1,1)} };   // освещённость дыма (день/ночь)
+const FXU = {
+  uAmb:{value:new THREE.Color(1,1,1)},        // рассеянный свет для дыма (день/ночь)
+  uSunDir:{value:new THREE.Vector3(0,1,0)}, uSunCol:{value:new THREE.Color(0,0,0)},
+  uFireCol:{value:new THREE.Color(1.0*1.9, 0.42*1.9, 0.12*1.9)}
+};
+const _pFwd = new THREE.Vector3(), _WHITE = [1,1,1];
+/** Частицы-билборды. kind: 'plain' — текстура × цвет; 'flame' — кадры атласа,
+    цвет по возрасту (бело-жёлтое ядро → оранжевый → тёмно-красный), HDR для
+    свечения; 'smoke' — освещённый дым: нормаль из атласа, солнце, небо и
+    подсветка пламенем снизу, сортировка по глубине, растворение у камеры. */
 class Particles {
-  constructor({tex, max=500, additive=false, lit=false, soft=1.0, stretch=false}){
-    this.max = max; this.n = 0;
+  constructor({tex, max=500, additive=false, lit=false, stretch=false, kind='plain', sheet=1, sort=false}){
+    this.max = max; this.kind = kind; this.sheet = sheet; this.sort = sort;
     const g = QUAD.clone();
-    this.aPos = new THREE.InstancedBufferAttribute(new Float32Array(max*3),3).setUsage(THREE.DynamicDrawUsage);
-    this.aSR  = new THREE.InstancedBufferAttribute(new Float32Array(max*2),2).setUsage(THREE.DynamicDrawUsage);
-    this.aCol = new THREE.InstancedBufferAttribute(new Float32Array(max*4),4).setUsage(THREE.DynamicDrawUsage);
-    this.aVel = new THREE.InstancedBufferAttribute(new Float32Array(max*3),3).setUsage(THREE.DynamicDrawUsage);
+    const dyn = n => new THREE.InstancedBufferAttribute(new Float32Array(max*n), n).setUsage(THREE.DynamicDrawUsage);
+    this.aPos = dyn(3); this.aSR = dyn(4); this.aCol = dyn(4); this.aVel = dyn(3); this.aExt = dyn(2);
     g.setAttribute('iPos', this.aPos); g.setAttribute('iSR', this.aSR); g.setAttribute('iCol', this.aCol);
-    g.setAttribute('iVel', this.aVel);
+    g.setAttribute('iVel', this.aVel); g.setAttribute('iExt', this.aExt);
     g.instanceCount = 0;
+    const frag = {
+      plain:`
+        vec4 t = texture2D(map, frameUv());
+        gl_FragColor = vec4(t.rgb*vCol.rgb*uAmb, t.a*vCol.a);
+        if(gl_FragColor.a < 0.004) discard;`,
+      flame:`
+        vec4 t = texture2D(map, frameUv());
+        float k = vExt.y;
+        vec3 g = mix(vec3(1.0,0.84,0.52)*2.4, vec3(1.0,0.40,0.09)*1.5, smoothstep(0.0,0.5,k));
+        g = mix(g, vec3(0.5,0.08,0.02)*0.6, smoothstep(0.5,1.0,k));
+        float a = t.a*vCol.a*smoothstep(0.05, 0.6, vDepth);
+        gl_FragColor = vec4(t.rgb*g*vCol.rgb, a);
+        if(a < 0.004) discard;`,
+      smoke:`
+        vec4 t = texture2D(map, frameUv());
+        float c = cos(vRot), s = sin(vRot);
+        vec2 nn = t.rg*2.0 - 1.0; nn = vec2(c*nn.x - s*nn.y, s*nn.x + c*nn.y);
+        vec2 q = vUv*2.0 - 1.0;   q = vec2(c*q.x - s*q.y, s*q.x + c*q.y);
+        vec3 nV = normalize(vec3(nn*1.2 + q*0.35, 0.9));
+        vec3 nW = normalize((vec4(nV, 0.0)*viewMatrix).xyz);
+        float sunL = clamp(dot(nW, uSunDir)*0.6 + 0.4, 0.0, 1.0);
+        float sky = clamp(nW.y*0.5 + 0.5, 0.0, 1.0);
+        vec3 light = uAmb*(0.5 + 0.5*sky) + uSunCol*sunL;
+        light += uFireCol*vExt.x*(0.3 + 0.7*clamp(0.5 - nW.y*0.5, 0.0, 1.0));
+        vec3 col = vCol.rgb*light*(0.7 + 0.3*t.b);
+        float a = t.a*vCol.a*smoothstep(0.2, 1.4, vDepth);
+        gl_FragColor = vec4(col, a);
+        if(a < 0.003) discard;`
+    }[kind];
     const mat = new THREE.ShaderMaterial({
       transparent:true, depthWrite:false,
       blending: additive ? THREE.AdditiveBlending : THREE.NormalBlending,
-      uniforms:{ map:{value:tex}, uAmb: lit ? FXU.uAmb : {value:new THREE.Color(1,1,1)}, uStretch:{value: stretch?1:0} },
+      uniforms:{ map:{value:tex}, uAmb: lit ? FXU.uAmb : {value:new THREE.Color(1,1,1)}, uStretch:{value: stretch?1:0},
+        uSheet:{value:sheet}, uSunDir:FXU.uSunDir, uSunCol:FXU.uSunCol, uFireCol:FXU.uFireCol },
       vertexShader:`
-        attribute vec3 iPos; attribute vec2 iSR; attribute vec4 iCol; attribute vec3 iVel;
+        attribute vec3 iPos; attribute vec4 iSR; attribute vec4 iCol; attribute vec3 iVel; attribute vec2 iExt;
         uniform float uStretch;
-        varying vec2 vUv; varying vec4 vCol;
+        varying vec2 vUv; varying vec4 vCol; varying vec2 vExt; varying float vFrame, vRot, vDepth;
         void main(){
-          vUv = uv; vCol = iCol;
+          vUv = uv; vCol = iCol; vExt = iExt; vFrame = iSR.w; vRot = iSR.z;
           vec4 mv = modelViewMatrix*vec4(iPos,1.0);
-          float c = cos(iSR.y), s = sin(iSR.y);
-          vec2 p = position.xy;
+          vDepth = -mv.z;
+          float c = cos(iSR.z), s = sin(iSR.z);
+          vec2 p = position.xy*iSR.xy;
           if(uStretch > 0.5){
             // искры вытягиваются вдоль скорости в экранной плоскости
             vec3 vv = (modelViewMatrix*vec4(iVel,0.0)).xyz;
             vec2 d = length(vv.xy) > 1e-4 ? normalize(vv.xy) : vec2(0.0,1.0);
             float L = 1.0 + length(vv.xy)*0.035;
             p = vec2(p.x, p.y*L);
-            mv.xy += vec2(d.y*p.x + d.x*p.y, -d.x*p.x + d.y*p.y)*iSR.x;
+            mv.xy += vec2(d.y*p.x + d.x*p.y, -d.x*p.x + d.y*p.y);
           } else {
-            mv.xy += vec2(c*p.x - s*p.y, s*p.x + c*p.y)*iSR.x;
+            mv.xy += vec2(c*p.x - s*p.y, s*p.x + c*p.y);
           }
           gl_Position = projectionMatrix*mv;
         }`,
       fragmentShader:`
-        uniform sampler2D map; uniform vec3 uAmb;
-        varying vec2 vUv; varying vec4 vCol;
-        void main(){
-          vec4 t = texture2D(map, vUv);
-          gl_FragColor = vec4(t.rgb*vCol.rgb*uAmb, t.a*vCol.a);
-          if(gl_FragColor.a < 0.004) discard;
-        }`
+        uniform sampler2D map; uniform vec3 uAmb, uSunDir, uSunCol, uFireCol; uniform float uSheet;
+        varying vec2 vUv; varying vec4 vCol; varying vec2 vExt; varying float vFrame, vRot, vDepth;
+        vec2 frameUv(){
+          if(uSheet < 1.5) return vUv;
+          float f = floor(vFrame + 0.5), cx = mod(f, uSheet), cy = floor(f/uSheet);
+          return (vec2(cx, uSheet - 1.0 - cy) + vUv)/uSheet;
+        }
+        void main(){ ${frag} }`
     });
     this.mesh = new THREE.Mesh(g, mat);
     this.mesh.frustumCulled = false; this.mesh.renderOrder = additive ? 6 : 5;
     this.mesh.userData.nomerge = true;
-    this.P = [];   // данные симуляции
+    this.P = [];      // живые частицы
+    this.free = [];   // пул: частицы не создаются заново при каждом выстреле
     scene.add(this.mesh);
   }
-  /** o: {p, v, life, s0, s1, rot, spin, col:[r,g,b], a0, a1, drag, g, turb} */
+  /** o: {p, v, life, s0, s1, asp, rot, spin, col:[r,g,b], a0, a1, aPow, drag, g, turb, fadeIn,
+         heat, frame, fps, ceil, wind} */
   spawn(o){
-    if(this.P.length >= this.max){ this.P.shift(); }
-    this.P.push({ p:o.p.clone(), v:(o.v||new THREE.Vector3()).clone(), t:0, life:o.life||1,
-      s0:o.s0??0.3, s1:o.s1??o.s0??0.3, rot:o.rot??Math.random()*6.28, spin:o.spin??0,
-      col:o.col||[1,1,1], a0:o.a0??1, a1:o.a1??0, drag:o.drag??0.5, g:o.g??0, turb:o.turb??0,
-      fadeIn:o.fadeIn??0.05, seed:Math.random()*100 });
+    let q;
+    if(this.P.length >= this.max) q = this.P.shift();
+    else q = this.free.pop() || { p:new THREE.Vector3(), v:new THREE.Vector3() };
+    q.p.copy(o.p); if(o.v) q.v.copy(o.v); else q.v.set(0,0,0);
+    q.t = 0; q.life = o.life || 1;
+    q.s0 = o.s0 ?? 0.3; q.s1 = o.s1 ?? o.s0 ?? 0.3; q.asp = o.asp ?? 1;
+    q.rot = o.rot ?? Math.random()*6.28; q.spin = o.spin ?? 0;
+    q.col = o.col || _WHITE; q.a0 = o.a0 ?? 1; q.a1 = o.a1 ?? 0; q.aPow = o.aPow ?? 1;
+    q.drag = o.drag ?? 0.5; q.g = o.g ?? 0; q.turb = o.turb ?? 0; q.fadeIn = o.fadeIn ?? 0.05;
+    q.heat = o.heat ?? 0; q.fps = o.fps ?? 0; q.ceil = o.ceil ?? 1e9; q.wind = o.wind ?? 0;
+    q.frame = o.frame ?? (this.sheet > 1 ? Math.floor(Math.random()*this.sheet*this.sheet) : 0);
+    q.seed = Math.random()*100; q.floor = o.floor;
+    this.P.push(q);
   }
   update(dt, time){
-    const P = this.P;
+    const P = this.P, W = WIND.vec, N = this.sheet*this.sheet;
     for(let i=P.length-1;i>=0;i--){
       const q = P[i]; q.t += dt;
-      if(q.t >= q.life){ P[i] = P[P.length-1]; P.pop(); continue; }
+      if(q.t >= q.life){ P[i] = P[P.length-1]; P.pop(); this.free.push(q); continue; }
       q.v.y += q.g*dt;
       if(q.turb){ q.v.x += Math.sin(time*3.1+q.seed)*q.turb*dt; q.v.z += Math.cos(time*2.7+q.seed*1.3)*q.turb*dt; }
+      if(q.wind){ q.v.x += W.x*q.wind*dt; q.v.z += W.z*q.wind*dt; }
       const dr = Math.max(0, 1 - q.drag*dt);
       q.v.multiplyScalar(dr);
       q.p.addScaledVector(q.v, dt);
+      // дым упирается в потолок и растекается под ним слоем
+      if(q.p.y > q.ceil){
+        q.p.y = q.ceil;
+        if(q.v.y > 0){ const a = q.seed*2.7, up = q.v.y*0.7; q.v.x += Math.cos(a)*up; q.v.z += Math.sin(a)*up; q.v.y = 0; }
+      }
       if(q.floor !== undefined && q.p.y < q.floor){ q.p.y = q.floor; q.v.y *= -0.3; q.v.x*=0.5; q.v.z*=0.5; }
       q.rot += q.spin*dt;
     }
+    // прозрачный дым рисуется от дальнего к ближнему, иначе клубы «просвечивают»
+    if(this.sort && P.length > 1){
+      camera.getWorldDirection(_pFwd); const c = camera.position;
+      for(const q of P) q.dk = (q.p.x-c.x)*_pFwd.x + (q.p.y-c.y)*_pFwd.y + (q.p.z-c.z)*_pFwd.z;
+      P.sort((a,b)=> b.dk - a.dk);
+    }
     const n = Math.min(P.length, this.max);
-    const pa = this.aPos.array, sr = this.aSR.array, ca = this.aCol.array, va = this.aVel.array;
+    const pa = this.aPos.array, sr = this.aSR.array, ca = this.aCol.array, va = this.aVel.array, ea = this.aExt.array;
+    const smoke = this.kind === 'smoke';
     for(let i=0;i<n;i++){
       const q = P[i], k = q.t/q.life;
       pa[i*3]=q.p.x; pa[i*3+1]=q.p.y; pa[i*3+2]=q.p.z;
       va[i*3]=q.v.x; va[i*3+1]=q.v.y; va[i*3+2]=q.v.z;
-      sr[i*2] = lerp(q.s0, q.s1, Math.sqrt(k)); sr[i*2+1] = q.rot;
+      // дым быстро раздувается в начале и медленно — потом
+      const gk = smoke ? 1 - (1-k)*(1-k) : Math.sqrt(k);
+      const sz = q.s0 + (q.s1 - q.s0)*gk;
+      sr[i*4] = sz; sr[i*4+1] = sz*q.asp; sr[i*4+2] = q.rot;
+      sr[i*4+3] = N > 1 ? (q.fps ? Math.floor(q.frame + q.t*q.fps) % N : q.frame) : 0;
       const fin = q.fadeIn > 0 ? clamp(q.t/q.fadeIn, 0, 1) : 1;
-      ca[i*4]=q.col[0]; ca[i*4+1]=q.col[1]; ca[i*4+2]=q.col[2]; ca[i*4+3]=lerp(q.a0, q.a1, k)*fin;
+      const ak = q.aPow === 1 ? k : Math.pow(k, q.aPow);
+      ca[i*4]=q.col[0]; ca[i*4+1]=q.col[1]; ca[i*4+2]=q.col[2]; ca[i*4+3]=(q.a0 + (q.a1 - q.a0)*ak)*fin;
+      ea[i*2] = q.heat ? q.heat*Math.exp(-q.t*0.9) : 0; ea[i*2+1] = k;
     }
     this.mesh.geometry.instanceCount = n;
-    this.aPos.needsUpdate = this.aSR.needsUpdate = this.aCol.needsUpdate = this.aVel.needsUpdate = true;
-    this.aPos.clearUpdateRanges(); this.aPos.addUpdateRange(0, n*3);
-    this.aSR.clearUpdateRanges();  this.aSR.addUpdateRange(0, n*2);
-    this.aCol.clearUpdateRanges(); this.aCol.addUpdateRange(0, n*4);
-    this.aVel.clearUpdateRanges(); this.aVel.addUpdateRange(0, n*3);
+    for(const [a, m] of [[this.aPos,3],[this.aSR,4],[this.aCol,4],[this.aVel,3],[this.aExt,2]]){
+      a.needsUpdate = true; a.clearUpdateRanges(); a.addUpdateRange(0, n*m);
+    }
   }
+}
+
+/* ---------- процедурный шум для атласов огня и дыма ---------- */
+function makeNoise2(seed){
+  let s = seed >>> 0;
+  const r = ()=>{ s = (s*1664525 + 1013904223) >>> 0; return s/4294967296; };
+  const perm = new Uint8Array(512), val = new Float32Array(256), base = [];
+  for(let i=0;i<256;i++){ base.push(i); val[i] = r(); }
+  for(let i=255;i>0;i--){ const j = Math.floor(r()*(i+1)); const t = base[i]; base[i] = base[j]; base[j] = t; }
+  for(let i=0;i<512;i++) perm[i] = base[i & 255];
+  return (x, y)=>{
+    const xi = Math.floor(x), yi = Math.floor(y), xf = x - xi, yf = y - yi;
+    const u = xf*xf*(3-2*xf), v = yf*yf*(3-2*yf), X = xi & 255, Y = yi & 255;
+    const a = val[perm[perm[X] + Y]], b = val[perm[perm[X+1] + Y]], c = val[perm[perm[X] + Y + 1]], d = val[perm[perm[X+1] + Y + 1]];
+    return a + (b-a)*u + (c-a)*v + (a-b-c+d)*u*v;
+  };
+}
+/** Атлас языков пламени 4×4: турбулентный язык, анимация зациклена (16 кадров). */
+function flameAtlas(S){
+  const C = 4, N = 16, [c, x] = cv(S*C, S*C), img = x.createImageData(S*C, S*C), d = img.data;
+  const n1 = makeNoise2(11), n2 = makeNoise2(23);
+  const fbm = (n, a, b)=> n(a, b)*0.55 + n(a*2.03, b*2.03)*0.28 + n(a*4.1, b*4.1)*0.17;
+  for(let f=0; f<N; f++){
+    const ox = (f % C)*S, oy = Math.floor(f/C)*S, tt = f/N;
+    for(let py=0; py<S; py++) for(let px=0; px<S; px++){
+      const u = (px/S - 0.5)*2, v = py/S, h = 1 - v;              // h: 0 — основание, 1 — верх
+      // бесшовный цикл: два отсчёта шума, сдвинутые на длину цикла, смешиваются по времени
+      const y0 = h*2.6 - tt*2.6, y1 = h*2.6 - (tt - 1)*2.6;
+      const sway = (fbm(n1, u*1.3 + 7, y0)*(1-tt) + fbm(n1, u*1.3 + 7, y1)*tt) - 0.5;
+      const w = 0.6*Math.pow(1 - h, 0.6) + 0.05;
+      const r = Math.abs(u + sway*0.9*h)/w;
+      let a = clamp(1 - r, 0, 1)*smoothstepJS(1.0, 0.84, v);
+      const brk = fbm(n2, u*2.6 + 3, y0*1.6)*(1-tt) + fbm(n2, u*2.6 + 3, y1*1.6)*tt;
+      a *= smoothstepJS(h*0.9 - 0.12, h*0.9 + 0.2, brk + 0.3*(1 - h));
+      a = Math.pow(a, 0.85);
+      const core = Math.pow(clamp(1 - r*1.7, 0, 1), 2)*(1 - h*0.8);
+      const i = ((oy + py)*S*C + ox + px)*4;
+      d[i] = 255; d[i+1] = Math.round(150 + 105*core); d[i+2] = Math.round(70 + 185*core*core); d[i+3] = Math.round(255*a);
+    }
+  }
+  x.putImageData(img, 0, 0);
+  return texOf(c);
+}
+/** Атлас клубов дыма 2×2: плотность из сгустков + fbm; RG — нормаль (для
+    освещения в шейдере), B — толщина, A — непрозрачность. */
+function smokeAtlas(S){
+  const C = 2, [c, x] = cv(S*C, S*C), img = x.createImageData(S*C, S*C), d = img.data;
+  const n1 = makeNoise2(5);
+  const fbm = (a, b)=> n1(a, b)*0.5 + n1(a*2.1, b*2.1)*0.3 + n1(a*4.3, b*4.3)*0.2;
+  const D = new Float32Array(S*S);
+  for(let f=0; f<C*C; f++){
+    const ox = (f % C)*S, oy = Math.floor(f/C)*S;
+    const blobs = [];
+    for(let k=0;k<9;k++){ const a = rnd2()*6.283, rr = rnd2()*0.28; blobs.push([Math.cos(a)*rr, Math.sin(a)*rr, 0.16 + rnd2()*0.17]); }
+    for(let py=0; py<S; py++) for(let px=0; px<S; px++){
+      const u = px/S*2 - 1, v = py/S*2 - 1;
+      let den = 0;
+      for(const [bx, by, br] of blobs){ const q = ((u-bx)**2 + (v-by)**2)/(br*br); den += Math.exp(-q*1.6); }
+      den *= 0.45 + 0.75*fbm(u*2.4 + f*3.1, v*2.4 + f*1.7);
+      den *= Math.pow(smoothstepJS(1.0, 0.25, Math.hypot(u, v)), 1.4);
+      D[py*S + px] = clamp(den, 0, 1.3);
+    }
+    for(let py=0; py<S; py++) for(let px=0; px<S; px++){
+      const at = (xx, yy)=> D[clamp(yy, 0, S-1)*S + clamp(xx, 0, S-1)];
+      const gx = at(px+2, py) - at(px-2, py), gy = at(px, py+2) - at(px, py-2);
+      const den = D[py*S + px];
+      const i = ((oy + py)*S*C + ox + px)*4;
+      d[i]   = Math.round(clamp(0.5 - gx*1.6, 0, 1)*255);
+      d[i+1] = Math.round(clamp(0.5 + gy*1.6, 0, 1)*255);       // canvas y вниз, в шейдере — вверх
+      d[i+2] = Math.round(clamp(den, 0, 1)*255);
+      d[i+3] = Math.round(clamp(Math.pow(den, 1.5)*0.95, 0, 1)*255);
+    }
+  }
+  x.putImageData(img, 0, 0);
+  const t = texOf(c, false);
+  return t;
 }
 
 /* ============================================================================
@@ -3652,7 +4079,7 @@ const SND = {
     this.ok = true;
     this._ambience();
   },
-  resume(){ if(this.ctx && this.ctx.state !== 'running') this.ctx.resume(); },
+  resume(){ if(this.ctx && this.ctx.state !== 'running') this.ctx.resume(); if(this.master) this.master.gain.value = 0.8*SET.vol/100; },
   _src(buf, loop=false){ const s = this.ctx.createBufferSource(); s.buffer = buf || this.noise; s.loop = loop; return s; },
   /** Цепочка выхода: панорама в 3D + отправка в ревербератор. */
   _out(pos, wet=0.5, ref=3){
@@ -3662,10 +4089,35 @@ const SND = {
       p.panningModel = Q.lights >= 6 ? 'HRTF' : 'equalpower'; p.distanceModel = 'inverse';
       p.refDistance = ref; p.rolloffFactor = 1.1; p.maxDistance = 200;
       p.positionX.value = pos.x; p.positionY.value = pos.y; p.positionZ.value = pos.z;
-      g.connect(p); p.connect(this.master);
-      const w = ctx.createGain(); w.gain.value = wet; g.connect(w); w.connect(this.wet);
+      // за стенами звук глохнет: низкочастотный фильтр и тише (прямой звук),
+      // а реверберация ангара остаётся — она огибает препятствия
+      const occ = this._occlusion(pos);
+      let head = g;
+      if(occ > 0){
+        const f = ctx.createBiquadFilter(); f.type = 'lowpass'; f.Q.value = 0.5;
+        f.frequency.value = lerp(5000, 520, occ);
+        const og = ctx.createGain(); og.gain.value = 1 - 0.55*occ;
+        g.connect(f); f.connect(og); head = og;
+      }
+      head.connect(p); p.connect(this.master);
+      const w = ctx.createGain(); w.gain.value = wet*(1 - 0.35*occ); head.connect(w); w.connect(this.wet);
     } else { g.connect(this.master); const w = ctx.createGain(); w.gain.value = wet*0.6; g.connect(w); w.connect(this.wet); }
     return g;
+  },
+  /** 0 — прямая видимость, до 1 — за несколькими стенами. */
+  _occlusion(pos){
+    if(!PH.ready) return 0;
+    const cam = camera.position, d = cam.distanceTo(pos);
+    if(d < 1.2) return 0;
+    const hits = rayAll(cam, pos, GRP.STATIC);
+    let n = 0, lastF = -1;
+    for(const h of hits){
+      if(h.idx === -10 || (1 - h.f)*d < 0.35) continue;      // сам игрок и поверхность, на которой звучит источник
+      if(lastF >= 0 && (h.f - lastF)*d < 0.3) continue;      // обе обшивки одной стены — одна преграда
+      n++; lastF = h.f;
+      if(n >= 3) break;
+    }
+    return n ? Math.min(1, 0.5 + 0.25*(n-1)) : 0;
   },
   _delay(pos){ if(!pos) return 0; return camera.position.distanceTo(pos)/343; },
   listener(){
@@ -3748,6 +4200,35 @@ const SND = {
     else if(surf==='wood'){ this._burst(out, t, 0.07, 'lowpass', 700, 180, 1.2, 0.2*k); this._tone(out, t, 0.06, 150, 90, 0.06*k); }
     else { this._burst(out, t, 0.05, 'bandpass', 1200, 500, 0.9, 0.14*k); }
   },
+  /** Перезарядка: отстёгнутый магазин, вставка, затвор (на пустом). */
+  reload(tactical){
+    if(!this.ok) return; const t = this.ctx.currentTime, out = this._out(null, 0.15);
+    this._burst(out, t+0.25, 0.04, 'bandpass', 1600, 1300, 4, 0.22);                 // защёлка
+    this._burst(out, t+0.35, 0.09, 'lowpass', 900, 300, 1, 0.12);                   // магазин выходит
+    this._burst(out, t+1.25, 0.05, 'bandpass', 2100, 1500, 5, 0.3);                 // новый магазин
+    this._tone(out, t+1.27, 0.05, 420, 300, 0.08);
+    if(!tactical){ this._burst(out, t+2.15, 0.03, 'bandpass', 3000, 2400, 6, 0.3); this._burst(out, t+2.3, 0.04, 'bandpass', 2000, 1600, 5, 0.3); }
+  },
+  /** Отметка попадания: короткий сухой щелчок, на поражение — двойной. */
+  hitmark(kill){
+    if(!this.ok) return; const t = this.ctx.currentTime, out = this._out(null, 0);
+    this._tone(out, t, 0.05, 1900, 1700, 0.07, 'triangle');
+    if(kill) this._tone(out, t+0.07, 0.07, 1350, 1100, 0.08, 'triangle');
+  },
+  /** Ящик с боеприпасами: крышка, возня с магазинами. */
+  supply(pos){
+    if(!this.ok) return; const t = this.ctx.currentTime, out = this._out(pos, 0.3, 2);
+    this._burst(out, t, 0.12, 'lowpass', 700, 250, 1, 0.35); this._tone(out, t, 0.1, 180, 120, 0.12);
+    for(let i=0;i<5;i++) this._burst(out, t+0.35+i*0.22+Math.random()*0.08, 0.04, 'bandpass', rnd(1500,2600), 1400, 5, 0.18);
+    this._burst(out, t+1.5, 0.1, 'lowpass', 800, 250, 1, 0.3);
+  },
+  /** Дверь: скрип петель при открывании, удар при закрывании и выбивании. */
+  door(pos, kind){
+    if(!this.ok) return; const t = this.ctx.currentTime + this._delay(pos), out = this._out(pos, 0.5, 2.5);
+    if(kind === 'open'){ this._burst(out, t, rnd(0.35,0.6), 'bandpass', rnd(700,1100), rnd(500,800), 25, 0.05, 0.08); this._burst(out, t, 0.04, 'bandpass', 1800, 1500, 4, 0.15); }
+    else if(kind === 'close'){ this._burst(out, t, 0.09, 'lowpass', 600, 150, 0.8, 0.5); this._tone(out, t, 0.12, 130, 70, 0.25); this._burst(out, t+0.02, 0.03, 'bandpass', 2400, 2000, 5, 0.2); }
+    else { this._burst(out, t, 0.14, 'lowpass', 1200, 120, 0.7, 0.9); this._tone(out, t, 0.2, 110, 50, 0.5); this.wood(pos, 1.6); }
+  },
   bounce(pos){ if(!this.ok) return; const t=this.ctx.currentTime, out=this._out(pos,0.3,1.5); this._tone(out,t,0.1,rnd(1100,1500),900,0.12); },
   click(){ if(!this.ok) return; const t=this.ctx.currentTime, out=this._out(null,0.1); this._burst(out,t,0.03,'bandpass',2500,2500,5,0.25); this._burst(out,t+0.12,0.03,'bandpass',1800,1800,5,0.25); },
   /** Огонь: непрерывный рокот + случайные щелчки, громкость по ближайшему пламени. */
@@ -3798,13 +4279,13 @@ const SND = {
 const FXS = {};
 function initFX(){
   const k = Q.dust >= 4000 ? 1 : (Q.dust >= 2000 ? 0.7 : 0.45);
-  FXS.flame = new Particles({tex:FX.flame, max:Math.round(900*k), additive:true});
-  FXS.smoke = new Particles({tex:FX.smoke, max:Math.round(1400*k), lit:true});
-  FXS.dust  = new Particles({tex:FX.smoke, max:Math.round(900*k), lit:true});
+  FXS.flame = new Particles({tex:FX.flameAtlas, max:Math.round(1100*k), additive:true, kind:'flame', sheet:4});
+  FXS.smoke = new Particles({tex:FX.smokeAtlas, max:Math.round(1500*k), lit:true, kind:'smoke', sheet:2, sort:true});
+  FXS.dust  = new Particles({tex:FX.smokeAtlas, max:Math.round(900*k), lit:true, kind:'smoke', sheet:2, sort:true});
   FXS.spark = new Particles({tex:FX.glow,  max:600, additive:true, stretch:true});
   FXS.ember = new Particles({tex:FX.glow,  max:500, additive:true});
   FXS.flash = new Particles({tex:FX.glow,  max:180, additive:true});
-  FXS.fireball = new Particles({tex:FX.flame, max:120, additive:true});
+  FXS.fireball = new Particles({tex:FX.flameAtlas, max:160, additive:true, kind:'flame', sheet:4});
   const box = new THREE.BoxGeometry(1,1,1);
   const tri = new THREE.BufferGeometry();
   tri.setAttribute('position', new THREE.BufferAttribute(new Float32Array([-0.5,-0.4,0, .5,-0.3,0, .05,.5,0]),3));
@@ -4245,6 +4726,35 @@ function registerGlass(mesh, o={}){
   hashAdd(gl.center, {t:'g', g:gl});
   return gl;
 }
+/** Целые стёкла рисуются одним InstancedMesh на материал (было по мешу на
+    стекло — 68 вызовов). Разбитое стекло просто гасит свой экземпляр. */
+function instanceGlass(){
+  const groups = new Map();
+  for(const gl of DEST.glass){
+    const m = gl.mesh; if(!m || !m.parent || m.isInstancedMesh || Array.isArray(m.material)) continue;
+    if(!groups.has(m.material)) groups.set(m.material, []);
+    groups.get(m.material).push(gl);
+  }
+  const unit = new THREE.PlaneGeometry(1, 1), zero = new THREE.Matrix4().makeScale(0,0,0);
+  const mw = new THREE.Matrix4(), sc = new THREE.Matrix4(), box = new THREE.Box3(), size = new THREE.Vector3(), ctr = new THREE.Vector3();
+  for(const [mat, list] of groups){
+    if(list.length < 2) continue;
+    const im = new THREE.InstancedMesh(unit, mat, list.length);
+    im.userData.nomerge = true; im.castShadow = false; im.receiveShadow = list[0].mesh.receiveShadow;
+    im.renderOrder = list[0].mesh.renderOrder;
+    list.forEach((gl, i)=>{
+      const m = gl.mesh;
+      m.updateWorldMatrix(true, false);
+      m.geometry.computeBoundingBox(); box.copy(m.geometry.boundingBox); box.getSize(size); box.getCenter(ctr);
+      mw.copy(m.matrixWorld).multiply(sc.makeTranslation(ctr.x, ctr.y, ctr.z)).multiply(sc.makeScale(size.x || 1, size.y || 1, 1));
+      im.setMatrixAt(i, mw);
+      m.removeFromParent();
+      gl.mesh = { material: mat, set visible(v){ if(!v){ im.setMatrixAt(i, zero); im.instanceMatrix.needsUpdate = true; } } };
+    });
+    im.computeBoundingSphere();
+    scene.add(im);
+  }
+}
 function glassBody(gl){
   const c = {cx:gl.center.x, cy:gl.center.y, cz:gl.center.z, hx:gl.w/2, hy:gl.h/2, hz:0.012,
              q:[gl.q.x,gl.q.y,gl.q.z,gl.q.w], surf:'glass', noPlayer: !gl.playerCollide};
@@ -4327,7 +4837,7 @@ function registerProp(group, o={}){
   const center = box.getCenter(V$3()), size = box.getSize(V$3());
   const p = { group, hp:o.hp ?? 150, dead:false, wood:o.wood ?? true, surf:o.surf || 'wood', center,
     col: o.col || {cx:center.x, cy:center.y, cz:center.z, hx:size.x/2, hy:size.y/2, hz:size.z/2, q:null},
-    onBreak:o.onBreak || null, explosive: !!o.explosive, mass:o.mass ?? 8, burnHp: o.burnHp ?? 1,
+    onBreak:o.onBreak || null, explosive: !!o.explosive, target: !!o.target, mass:o.mass ?? 8, burnHp: o.burnHp ?? 1,
     parts:[], ranges:[] };
   group.traverse(m=>{
     if(!m.isMesh) return;
@@ -4447,9 +4957,11 @@ function bulletHit(hit, dir, power){
     impactFX(hit.p, hit.n, p.surf, dir);
     p.hp -= dmg;
     if(p.explosive && p.hp < 60 && !p.leaking){ p.leaking = true; if(HOOKS.leak) HOOKS.leak(p, hit.p); }
-    if(p.hp <= 0) breakProp(p, hit.p, dir, power, 'bullet');
-    return {stop: !p.wood, cost:0.5, surf:p.surf};
+    const killed = p.hp <= 0;
+    if(killed) breakProp(p, hit.p, dir, power, 'bullet');
+    return {stop: !p.wood, cost:0.5, surf:p.surf, feedback: p.target ? (killed ? 2 : 1) : 0};
   }
+  if(own.type === 'door') return doorBulletHit(own.d, hit, dir, power);
   if(own.type === 'dyn'){
     const r = own.rec;
     impulse(r.body, dir.x*2.5*power, dir.y*2.5*power, dir.z*2.5*power, 0,0,0);
@@ -4515,6 +5027,7 @@ function explode(p, o={}){
   blastImpulse(p, R*1.3, 28*P);
   pokeCloth(p, R*2.5, 60*P);
   if(HOOKS.playerBlast) HOOKS.playerBlast(p, R, P);
+  if(HOOKS.doorBlast) HOOKS.doorBlast(p, R*0.8, P);
   charSphere(p, R*0.45, 0.35*P, 0.15);
   if(HOOKS.ignite){
     if(o.fire) HOOKS.ignite(p, o.fire, R*0.5);
@@ -5889,7 +6402,6 @@ function helicopter(x, y, z, rotY){
     t.position.set(px, py-0.18, pz); t.rotation.z = 0.2; G.add(t); }
   G.position.set(x, y, z); G.rotation.y = rotY;
   shadowAll(G);
-  G.userData.nomerge = true;
   scene.add(G);
   // коллайдеры: кабина, хвостовая балка, лыжи
   const q = new THREE.Quaternion().setFromAxisAngle(V$2(0,1,0), rotY);
@@ -5904,13 +6416,39 @@ function helicopter(x, y, z, rotY){
 /* ============================================================================
    ГАБИОН HESCO: проволочная сетка + мешок с песком. Держит пули.
 ============================================================================ */
+/** Мешок габиона: не коробка, а ткань, выпирающая между прутьями сетки
+    (ячейка ~7.5 см) и просевшая к верху. На high — мельче рельеф. */
+const _hescoGeo = new Map();
+function hescoSandGeo(cell, h){
+  const key = cell + '|' + h;
+  if(_hescoGeo.has(key)) return _hescoGeo.get(key);
+  const seg = Q.tex >= 1 ? 6 : 3;
+  const g = roundedBox(cell-0.04, h-0.04, cell-0.04, 0.1, seg);
+  const pa = g.attributes.position, v = new THREE.Vector3(), nrm = new THREE.Vector3();
+  const half = (cell-0.04)/2, cellW = Q.tex >= 1 ? 0.075*2 : 0.075*4;
+  for(let i=0;i<pa.count;i++){
+    v.fromBufferAttribute(pa, i);
+    nrm.set(v.x/half, 0, v.z/half);
+    const side = Math.max(Math.abs(nrm.x), Math.abs(nrm.z));
+    // выпор между прутьями + общий «живот» к середине грани, верх просел
+    const bx = Math.abs(Math.sin((v.x + v.z)/cellW*Math.PI)), by = Math.abs(Math.sin(v.y/cellW*Math.PI));
+    const belly = (1 - Math.pow(Math.abs(v.y)/(h/2), 2))*0.035;
+    const k = side > 0.98 ? (belly + bx*by*0.012) : 0;
+    const len = Math.hypot(nrm.x, nrm.z) || 1;
+    pa.setXYZ(i, v.x + nrm.x/len*k, v.y - (v.y > h/2 - 0.12 ? 0.03 : 0), v.z + nrm.z/len*k);
+  }
+  g.computeVertexNormals();
+  _hescoGeo.set(key, g);
+  return g;
+}
 function hesco(x, z, rotY, n=3, h=1.35, y=0){
   const cell = 1.05;
   const L = n*cell;
   const G = new THREE.Group();
+  const sandGeo = hescoSandGeo(cell, h);
   for(let i=0;i<n;i++){
     const off = (i-(n-1)/2)*cell;
-    const sand = new THREE.Mesh(roundedBox(cell-0.04, h-0.04, cell-0.04, 0.1, 2), M.hesco);
+    const sand = new THREE.Mesh(sandGeo, M.hesco);
     sand.position.set(off, h/2, 0); sand.scale.set(1, 1, 1); G.add(sand);
     // верх: насыпь горбом
     const top = new THREE.Mesh(new THREE.SphereGeometry(0.5, 12, 6, 0, Math.PI*2, 0, Math.PI/2), M.sand);
@@ -5929,20 +6467,39 @@ function hesco(x, z, rotY, n=3, h=1.35, y=0){
   addAABB(x, y+h/2, z, L, h, cell, rotY, 'sand');
   return G;
 }
+/** Три варианта мешка: подушка, прошитая по краям и просевшая под весом, со
+    складками ткани (на high — плотнее сетка и мельче складки). */
+let _bagGeos = null;
+function sandbagGeos(){
+  if(_bagGeos) return _bagGeos;
+  _bagGeos = [];
+  const seg = Q.tex >= 1 ? 5 : 3;
+  for(let vi=0; vi<3; vi++){
+    const bag = roundedBox(0.6, 0.16, 0.34, 0.065, seg);
+    const pa = bag.attributes.position, ph = vi*1.7;
+    for(let i=0;i<pa.count;i++){
+      const x = pa.getX(i), z = pa.getZ(i), y = pa.getY(i);
+      const k = 1 - Math.pow(Math.abs(x)/0.3, 4)*0.35;
+      const wr = (Math.sin(x*38 + ph)*Math.sin(z*29 - ph) + Math.sin(x*71 + z*53 + ph*2)*0.5)*0.006*(y > 0 ? 1 : 0.4);
+      pa.setXYZ(i, x*(1 + Math.sin(ph + z*9)*0.02), y*k + (y > 0 ? wr - Math.max(0, 0.02 - Math.abs(z)*0.1)*(1 - Math.abs(x)/0.3) : 0),
+        z*(1 - Math.pow(Math.abs(x)/0.3, 6)*0.25) + wr*0.5);
+    }
+    bag.computeVertexNormals();
+    _bagGeos.push(bag);
+  }
+  return _bagGeos;
+}
 /** Мешки с песком: уложенные вперевязку «кирпичи» с продавленной серединой. */
 function sandbagWall(x, z, rotY, len=3.0, rows=4, y=0){
   const G = new THREE.Group();
   // мешок: скруглённая подушка, прошитая по краям, чуть просевшая под весом
-  const bag = roundedBox(0.6, 0.16, 0.34, 0.065, 3);
-  { const pa = bag.attributes.position; for(let i=0;i<pa.count;i++){ const x = pa.getX(i), z = pa.getZ(i), y = pa.getY(i);
-      const k = 1 - Math.pow(Math.abs(x)/0.3, 4)*0.35; pa.setY(i, y*k); pa.setZ(i, z*(1 - Math.pow(Math.abs(x)/0.3, 6)*0.25)); }
-    bag.computeVertexNormals(); }
+  const bags = sandbagGeos();
   const per = Math.max(2, Math.round(len/0.58));
   for(let r=0;r<rows;r++){
     for(let i=0;i<per - (r%2); i++){
       const off = (i - (per-1-(r%2))/2)*0.58;
       for(const dz of [-0.17, 0.17]){
-        const m = new THREE.Mesh(bag, M.sandbag);
+        const m = new THREE.Mesh(bags[(r*7 + i*3 + (dz > 0 ? 1 : 0)) % bags.length], M.sandbag);
         m.position.set(off + rnd(-0.02,0.02), 0.075 + r*0.145, dz + rnd(-0.02,0.02));
         m.rotation.y = rnd(-0.06,0.06); m.rotation.z = rnd(-0.04,0.04);
         G.add(m);
@@ -6037,7 +6594,7 @@ function target(x, y, z, rotY){
   for(const s of [-1,1]) plank(G, M.wood, 0.035, 1.05, 0.02, s*0.14, 0.52, -0.02, 0, 0, s*0.03);
   plank(G, M.woodDark, 0.5, 0.05, 0.3, 0, 0.025, -0.02);
   G.position.set(x,y,z); G.rotation.y = rotY; shadowAll(G); scene.add(G);
-  return registerProp(G, {hp:90, mass:4, col:{cx:x, cy:y+1.1, cz:z, hx:0.24, hy:0.55, hz:0.05, q:qY(rotY)}});
+  return registerProp(G, {hp:90, mass:4, target:true, col:{cx:x, cy:y+1.1, cz:z, hx:0.24, hy:0.55, hz:0.05, q:qY(rotY)}});
 }
 /** Стол на козлах (можно перевернуть как укрытие — стоит на боку). */
 function table(x, y, z, rotY, flipped=false){
@@ -6242,7 +6799,8 @@ function base(teamKey){
   const sp = new THREE.SpotLight(T.accent, 0, 40, 0.7, 0.6, 1.2);
   sp.position.set(s*38.5, 8.5, 0); sp.target.position.set(s*30, 0, 0); SPOT_SRC.push(sp);
   TEAM_SPOTS.push(sp);
-  // ящик с боеприпасами и носилки у задней стены
+  // ящик пополнения боезапаса — в центре базы, за точкой возрождения (общий для обеих команд)
+  ammoBox(bx + s*1.9, 0.08, 0, Math.PI/2);
   dynBox(bx + s*1.8, 0.08, -3.3, 0.1, [0.7,0.35,0.4], M.teamD);
   dynBox(bx + s*1.8, 0.08, 3.3, -0.1, [0.7,0.35,0.4], M.teamD);
 }
@@ -6485,11 +7043,13 @@ function updateFire(dt, t){
     const want = f.fuel > 0 ? f.target : 0;
     f.I = clamp(f.I + (want > f.I ? 0.12 : -0.35)*dt, 0, 1);
     if(f.fuel <= 0 && f.I <= 0.01){ FIRES.splice(i,1); continue; }
-    emit(f, dt);
+    emit(f, dt, t);
     const d = f.p.distanceTo(camera.position);
     near += f.I * clamp(1 - d/14, 0, 1);
     if(d < nearD){ nearD = d; nearP = f.p; }
     if(!doTick) continue;
+    let cl = 0; for(const g of FIRES) if(g !== f && g.I > 0.2 && g.p.distanceToSquared(f.p) < 4) cl++;
+    f.cluster = cl;
     // обугливание и жар вокруг очага
     const r = 0.35 + f.I*0.9;
     charSphere(f.p.clone().addScaledVector(V$1(0,1,0), 0.25*f.I), r, 0.07*f.I*TT*6, 0.4 + 0.6*f.I);
@@ -6521,39 +7081,74 @@ function refAliveSafe(ref){
   if(ref.t==='p') return !ref.p.dead;
   return false;
 }
-V$1(0,1,0);
+const _ft1 = new THREE.Vector3(), _ft2 = new THREE.Vector3(), _fpe = new THREE.Vector3(), _fve = new THREE.Vector3();
+/** Высота, под которой копится дым этого очага (перекрытие, потолок, кровля). */
+function fireCeil(p, n){
+  const ox = n ? n.x*0.35 : 0, oz = n ? n.z*0.35 : 0;      // от стены отходим наружу: луч из толщи стены её не видит
+  const h = PH.ready ? rayFirst(_fpe.set(p.x + ox, p.y + 0.4, p.z + oz), _fve.set(p.x + ox, p.y + 14, p.z + oz), GRP.STATIC) : null;
+  return h ? h.p.y - 0.55 : roofY(p.z) - 0.7;
+}
+/** Пламя, свечение, дым и искры одного очага. f.cluster — число соседних
+    очагов: горящая стена или комната даёт высокие языки и тяжёлый чёрный дым,
+    одиночная головня — невысокое пламя и светлый дымок. */
 function emit(f, dt, t){
   const I = f.I; if(I <= 0.01) return;
-  // языки пламени: плотность и размер растут с силой огня
-  const rate = (10 + 34*I) * (Q.dust >= 2000 ? 1 : 0.7);
-  f._acc = (f._acc||0) + rate*dt;
+  const big = clamp((f.cluster || 0)/5, 0, 1);
+  const qk = Q.dust >= 2000 ? 1 : 0.7;
+  if(f.ceil === undefined) f.ceil = fireCeil(f.p, f.free ? null : f.n);
   const base = f.p;
+  // касательные к горящей поверхности: пламя стелется по стене, а не шаром
+  if(f.free){ _ft1.set(1,0,0); _ft2.set(0,0,1); }
+  else { _ft1.crossVectors(f.n, Math.abs(f.n.y) < 0.9 ? _dY : _ft2.set(1,0,0)).normalize(); _ft2.crossVectors(f.n, _ft1); }
+  // 1. языки пламени: анимированные кадры атласа, вытянуты вверх
+  f._acc = (f._acc||0) + (8 + 26*I)*qk*dt;
   while(f._acc >= 1){
     f._acc -= 1;
-    const spread = 0.12 + 0.35*I;
-    const p = V$1(base.x + rnd(-spread,spread), base.y + rnd(-0.1,0.25)*I, base.z + rnd(-spread,spread));
-    if(!f.free) p.addScaledVector(f.n, rnd(0.02,0.12));
-    FXS.flame.spawn({p, v:V$1(rnd(-0.2,0.2), rnd(0.9,1.9)*(0.6+I), rnd(-0.2,0.2)), life:rnd(0.5,1.0),
-      s0:rnd(0.35,0.6)*(0.5+I), s1:rnd(0.08,0.18), rot:rnd(-0.3,0.3), spin:rnd(-1,1),
-      col:[1, rnd(0.55,0.8), rnd(0.25,0.4)], a0:0.85, a1:0, drag:0.8, turb:1.2, fadeIn:0.08});
+    const spread = 0.1 + 0.3*I + 0.2*big;
+    _fpe.copy(base).addScaledVector(_ft1, rnd(-spread, spread)).addScaledVector(_ft2, f.free ? rnd(-spread, spread) : rnd(-0.1, 0.2)*I);
+    if(!f.free) _fpe.addScaledVector(f.n, rnd(0.03, 0.14));
+    const sz = rnd(0.26, 0.48)*(0.55 + I)*(1 + 0.5*big);
+    FXS.flame.spawn({p:_fpe, v:_fve.set(rnd(-0.15,0.15), rnd(0.8,1.6)*(0.6+I), rnd(-0.15,0.15)), life:rnd(0.45,0.9)*(1 + 0.3*big),
+      s0:sz, s1:sz*0.35, asp:1.55, rot:rnd(-0.2,0.2), spin:rnd(-0.4,0.4), col:[0.75 + 0.35*I, 0.75 + 0.35*I, 0.75 + 0.35*I],
+      a0:0.9, a1:0, drag:0.9, turb:1.0, fadeIn:0.06, fps:rnd(14,22)});
   }
+  // 2. сильный огонь: высокие медленные языки над очагом
+  if(I > 0.55){
+    f._bacc = (f._bacc||0) + (1.2 + 4*big)*qk*dt;
+    while(f._bacc >= 1){
+      f._bacc -= 1;
+      _fpe.copy(base).addScaledVector(_ft1, rnd(-0.25, 0.25)).add(_fve.set(0, 0.25 + 0.3*I, 0));
+      if(!f.free) _fpe.addScaledVector(f.n, 0.12);
+      const sz = rnd(0.65, 1.1)*(0.6 + 0.8*big);
+      FXS.flame.spawn({p:_fpe, v:_fve.set(rnd(-0.1,0.1), rnd(1.1,1.9), rnd(-0.1,0.1)), life:rnd(0.8,1.3),
+        s0:sz, s1:sz*0.5, asp:1.8, rot:rnd(-0.12,0.12), spin:rnd(-0.2,0.2), col:[0.9, 0.9, 0.9],
+        a0:0.55, a1:0, drag:0.7, turb:0.8, fadeIn:0.12, fps:rnd(10,16)});
+    }
+  }
+  // 3. горячее свечение у основания
   f._gacc = (f._gacc||0) + 3*dt;
   if(f._gacc >= 1){ f._gacc -= 1;
-    FXS.flash.spawn({p: base.clone().add(V$1(0, 0.3*I, 0)).addScaledVector(f.n, 0.15), life:0.45, s0:1.0+1.6*I, s1:1.2+1.8*I,
+    FXS.flash.spawn({p: _fpe.copy(base).add(_fve.set(0, 0.3*I, 0)).addScaledVector(f.n, 0.15), life:0.45, s0:1.0+1.6*I+big, s1:1.2+1.8*I+big,
       col:[1,0.45,0.12], a0:0.22*I, a1:0, fadeIn:0.15}); }
-  f._sacc = (f._sacc||0) + (1.2 + 3.5*I)*dt;
+  // 4. дым: сажа от горящего дерева почти чёрная, тлеющее — светлый буро-серый дымок.
+  //    Клубы поднимаются, раздуваются, подсвечены пламенем снизу и растекаются под потолком.
+  f._sacc = (f._sacc||0) + (1.3 + 3.2*I)*(1 + 1.3*big)*qk*dt;
   while(f._sacc >= 1){
     f._sacc -= 1;
-    const p = V$1(base.x + rnd(-0.2,0.2), base.y + 0.6*I + 0.3, base.z + rnd(-0.2,0.2));
-    const g = rnd(0.06, 0.16);
-    FXS.smoke.spawn({p, v:V$1(rnd(-0.15,0.15), rnd(0.7,1.3), rnd(-0.15,0.15)), life:rnd(5,9),
-      s0:0.35+0.4*I, s1:rnd(2.2,3.6), rot:rnd(0,6.28), spin:rnd(-0.2,0.2),
-      col:[g,g*0.95,g*0.9], a0:0.42*(0.4+I), a1:0, drag:0.12, turb:0.35, fadeIn:0.6});
+    _fpe.copy(base).add(_fve.set(rnd(-0.25,0.25), 0.4 + 0.5*I + rnd(0, 0.3), rnd(-0.25,0.25)));
+    if(!f.free) _fpe.addScaledVector(f.n, 0.25);
+    const soot = clamp(I*0.9 + big*0.5 - 0.15, 0, 1);
+    const g = lerp(0.3, 0.045, soot)*rnd(0.85, 1.15), w = rnd(0.9, 0.97);
+    const indoor = f.ceil < 6;
+    FXS.smoke.spawn({p:_fpe, v:_fve.set(rnd(-0.2,0.2), rnd(0.9,1.6)*(0.7 + 0.5*I), rnd(-0.2,0.2)), life:rnd(9,15),
+      s0:0.45 + 0.5*I, s1:rnd(2.6,4.2)*(1 + 0.4*big)*(indoor ? 0.8 : 1), rot:rnd(0,6.28), spin:rnd(-0.12,0.12),
+      col:[g*1.06, g*w, g*w*0.9], a0:lerp(0.38, 0.82, soot), a1:0, aPow:1.7, drag:0.35, g:0.35, turb:0.3, fadeIn:0.5,
+      heat:0.6 + 0.6*I, ceil:f.ceil, wind: indoor ? 0.004 : 0.014});
   }
-  if(Math.random() < I*dt*6){
-    FXS.ember.spawn({p: base.clone().add(V$1(rnd(-0.2,0.2), rnd(0,0.4), rnd(-0.2,0.2))),
-      v:V$1(rnd(-0.6,0.6), rnd(1.2,3.2), rnd(-0.6,0.6)), life:rnd(1.2,2.8), s0:rnd(0.02,0.04), s1:0.01,
-      col:[1,0.55,0.18], a0:1, a1:0, drag:0.4, turb:2.0, g:-0.3});
+  if(Math.random() < (I*6 + big*8)*dt){
+    FXS.ember.spawn({p: _fpe.copy(base).add(_fve.set(rnd(-0.3,0.3), rnd(0,0.5), rnd(-0.3,0.3))),
+      v:_fve.set(rnd(-0.6,0.6), rnd(1.4,3.6), rnd(-0.6,0.6)), life:rnd(1.2,3.2), s0:rnd(0.02,0.045), s1:0.01,
+      col:[1,0.55,0.18], a0:1, a1:0, drag:0.4, turb:2.4, g:-0.2});
   }
 }
 function spawnEmbers(p, n){
@@ -6592,27 +7187,70 @@ const PL = {
 };
 const keys = {};
 const EYE = 1.62, EYE_C = 1.05, HALF = 0.87;       // рост глаз и полувысота капсулы
-let SENS = 0.0018;
-const INPUT = { locked:false, mouseDown:false, rmb:false, onFire:null, onKey:null };
+const SENS = 0.0018;
+const INPUT = { locked:false, mouseDown:false, rmb:false, onFire:null, onKey:null, capture:null };
+
+/* ---------- настройки и назначение клавиш (localStorage) ---------- */
+const ACTIONS = [
+  ['fwd','Вперёд','KeyW'], ['back','Назад','KeyS'], ['left','Влево','KeyA'], ['right','Вправо','KeyD'],
+  ['jump','Прыжок','Space'], ['crouch','Присесть','KeyC'], ['sprint','Бег','ShiftLeft'], ['slow','Медленно (полёт)','AltLeft'],
+  ['reload','Перезарядка','KeyR'], ['frag','Граната','KeyG'], ['molotov','Зажигательная','KeyT'],
+  ['use','Дверь (с разбега — выбить)','KeyE'], ['supply','Ящик: пополнить','KeyF'], ['fly','Полёт / ходьба','KeyV'],
+  ['menu','Меню / точка','KeyM'], ['phase','Время суток','KeyN'], ['daypause','Пауза суток','KeyP'], ['hints','Подсказки','KeyH']
+];
+const SET_DEF = { sens:1, ads:0.55, inv:false, fov:72, vol:80, exp:1, tone:'agx', keys:{} };
+function loadSettings(){
+  try{
+    const s = JSON.parse(localStorage.getItem('angar07.settings') || '{}');
+    return Object.assign({}, SET_DEF, s, {keys: Object.assign({}, s.keys || {})});
+  }catch(e){ return Object.assign({}, SET_DEF, {keys:{}}); }
+}
+const SET = loadSettings();
+function saveSettings(){ try{ localStorage.setItem('angar07.settings', JSON.stringify(SET)); }catch(e){} }
+const KEYMAP = {};
+function rebuildKeymap(){ for(const [a,,def] of ACTIONS) KEYMAP[a] = SET.keys[a] || def; }
+rebuildKeymap();
+/** Клавиатура захвачена (полный экран + navigator.keyboard.lock): только тогда
+    Ctrl работает как присед — иначе Ctrl+W закрывает вкладку посреди боя. */
+const KB = { locked:false };
+const MOUSE_CODE = { 1:'Mouse3', 3:'Mouse4', 4:'Mouse5' };
+const CTRL = c => c === 'ControlLeft' || c === 'ControlRight';
+const down = a => !!keys[KEYMAP[a]] || (a === 'crouch' && KB.locked && !!(keys.ControlLeft || keys.ControlRight));
+const isKey = (a, code) => KEYMAP[a] === code || (a === 'crouch' && KB.locked && CTRL(code));
+function keyName(code){
+  if(!code) return '—';
+  const named = { Space:'Space', ShiftLeft:'Shift', ShiftRight:'R-Shift', ControlLeft:'Ctrl', ControlRight:'R-Ctrl', AltLeft:'Alt', AltRight:'R-Alt',
+    Tab:'Tab', CapsLock:'Caps', Backquote:'`', Enter:'Enter', Backspace:'Bksp', ArrowUp:'↑', ArrowDown:'↓', ArrowLeft:'←', ArrowRight:'→',
+    Mouse3:'СКМ', Mouse4:'Мышь 4', Mouse5:'Мышь 5' };
+  if(named[code]) return named[code];
+  return code.replace(/^Key/, '').replace(/^Digit/, '').replace(/^Numpad/, 'Num ');
+}
 
 function initPlayer(canvas){
   PL.char = makeCharacter(new THREE.Vector3(0, 5, -20), 0.32, 1.1, 0.42);
   addEventListener('keydown', e=>{
+    if(INPUT.capture){ e.preventDefault(); INPUT.capture(e.code); return; }
     if(e.code === 'Tab') e.preventDefault();
+    if(e.repeat){ if(INPUT.locked && (CTRL(e.code) || e.code === 'Space')) e.preventDefault(); return; }
     keys[e.code] = true;
     if(INPUT.onKey) INPUT.onKey(e.code, e);
-    if(['Space','ControlLeft','AltLeft'].includes(e.code) && INPUT.locked) e.preventDefault();
+    if(INPUT.locked && (e.code === 'Space' || e.code === 'AltLeft' || CTRL(e.code) || e.code === 'Escape')) e.preventDefault();
   });
   addEventListener('keyup', e=>{ keys[e.code] = false; });
   addEventListener('blur', ()=>{ for(const k in keys) keys[k] = false; INPUT.mouseDown = false; INPUT.rmb = false; });
   document.addEventListener('pointerlockchange', ()=>{ INPUT.locked = document.pointerLockElement === canvas; if(INPUT.onLock) INPUT.onLock(INPUT.locked); });
+  // Chrome примерно секунду после Esc отказывает в повторном захвате курсора:
+  // без этого обработчика меню закрывалось, а мышь оставалась свободной.
+  document.addEventListener('pointerlockerror', ()=>{ INPUT.locked = false; if(INPUT.onLockError) INPUT.onLockError(); });
   document.addEventListener('mousemove', e=>{
     if(!INPUT.locked) return;
-    const k = SENS * (1 - PL.ads*0.45);
-    PL.yaw -= e.movementX * k; PL.pitch = clamp(PL.pitch - e.movementY * k, -1.55, 1.55);
+    const k = SENS * SET.sens * lerp(1, SET.ads, PL.ads) * (camera.fov / SET.fov);
+    PL.yaw -= e.movementX * k; PL.pitch = clamp(PL.pitch - e.movementY * k * (SET.inv ? -1 : 1), -1.55, 1.55);
   });
-  canvas.addEventListener('mousedown', e=>{ if(!INPUT.locked) return; if(e.button===0) INPUT.mouseDown = true; if(e.button===2) INPUT.rmb = true; });
-  addEventListener('mouseup', e=>{ if(e.button===0) INPUT.mouseDown = false; if(e.button===2) INPUT.rmb = false; });
+  canvas.addEventListener('mousedown', e=>{ if(!INPUT.locked) return; if(e.button===0) INPUT.mouseDown = true; if(e.button===2) INPUT.rmb = true;
+    const code = MOUSE_CODE[e.button]; if(code){ keys[code] = true; if(INPUT.onKey) INPUT.onKey(code, e); } });
+  addEventListener('mouseup', e=>{ if(e.button===0) INPUT.mouseDown = false; if(e.button===2) INPUT.rmb = false;
+    const code = MOUSE_CODE[e.button]; if(code) keys[code] = false; });
   canvas.addEventListener('contextmenu', e=> e.preventDefault());
 }
 /** Появление в точке: капсула ставится на пол, взгляд — в сторону поля. */
@@ -6630,7 +7268,7 @@ function setFly(on){
   else { PL.char.enable(true); PL.char.warp(new THREE.Vector3(camera.position.x, camera.position.y - EYE + HALF + 0.1, camera.position.z)); }
 }
 const fwd = new THREE.Vector3(), right = new THREE.Vector3(), wish = new THREE.Vector3(), cpos = new THREE.Vector3();
-const _e = new THREE.Euler(0,0,0,'YXZ');
+const _e = new THREE.Euler(0,0,0,'YXZ'), _look = new THREE.Vector3(), _mv = new THREE.Vector3();
 function updatePlayer(dt, t){
   PL.shake = Math.max(0, PL.shake - dt*1.6);
   PL.flash = Math.max(0, PL.flash - dt*0.5);
@@ -6642,36 +7280,35 @@ function updatePlayer(dt, t){
   right.set(-fwd.z, 0, fwd.x);
   wish.set(0,0,0);
   if(PL.alive){
-    if(keys.KeyW) wish.add(fwd); if(keys.KeyS) wish.sub(fwd);
-    if(keys.KeyD) wish.add(right); if(keys.KeyA) wish.sub(right);
+    if(down('fwd')) wish.add(fwd); if(down('back')) wish.sub(fwd);
+    if(down('right')) wish.add(right); if(down('left')) wish.sub(right);
   }
   if(wish.lengthSq() > 0) wish.normalize();
   if(PL.fly){
     // свободный полёт: вперёд по взгляду, вверх/вниз клавишами
-    const sp = (keys.ShiftLeft ? 22 : keys.AltLeft ? 2.5 : 8);
-    const look = new THREE.Vector3(0,0,-1).applyEuler(_e.set(PL.pitch, PL.yaw, 0));
-    const mv = new THREE.Vector3();
-    if(keys.KeyW) mv.add(look); if(keys.KeyS) mv.sub(look);
-    if(keys.KeyD) mv.add(right); if(keys.KeyA) mv.sub(right);
-    if(keys.Space) mv.y += 1; if(keys.ControlLeft || keys.KeyC) mv.y -= 1;
+    const sp = (down('sprint') ? 22 : down('slow') ? 2.5 : 8);
+    const look = _look.set(0,0,-1).applyEuler(_e.set(PL.pitch, PL.yaw, 0));
+    const mv = _mv.set(0,0,0);
+    if(down('fwd')) mv.add(look); if(down('back')) mv.sub(look);
+    if(down('right')) mv.add(right); if(down('left')) mv.sub(right);
+    if(down('jump')) mv.y += 1; if(down('crouch')) mv.y -= 1;
     if(mv.lengthSq()>0) mv.normalize().multiplyScalar(sp);
     PL.vel.lerp(mv, 1 - Math.exp(-dt*6));
     PL.flyPos.addScaledVector(PL.vel, dt);
     PL.speed = PL.vel.length();
     camera.position.copy(PL.flyPos);
   } else {
-    const crouching = (keys.ControlLeft || keys.KeyC) && PL.alive;
+    const crouching = down('crouch') && PL.alive;
     PL.crouch = lerp(PL.crouch, crouching ? 1 : 0, 1 - Math.exp(-dt*10));
-    PL.sprint = keys.ShiftLeft && !crouching && PL.ads < 0.3 && wish.dot(fwd) > 0.3;
+    PL.sprint = down('sprint') && !crouching && PL.ads < 0.3 && wish.dot(fwd) > 0.3;
     const maxS = crouching ? 2.1 : (PL.sprint ? 6.6 : 4.3) * (1 - PL.ads*0.4);
     const onG = PL.char.onGround();
     const accel = onG ? 12 : 2.5;
-    const target = wish.clone().multiplyScalar(maxS);
-    PL.vel.x = lerp(PL.vel.x, target.x, 1 - Math.exp(-dt*accel));
-    PL.vel.z = lerp(PL.vel.z, target.z, 1 - Math.exp(-dt*accel));
+    PL.vel.x = lerp(PL.vel.x, wish.x*maxS, 1 - Math.exp(-dt*accel));
+    PL.vel.z = lerp(PL.vel.z, wish.z*maxS, 1 - Math.exp(-dt*accel));
     PL.char.setWalk(PL.vel.x/90, PL.vel.z/90);
-    if(keys.Space && onG && PL.alive && !PL._jumpHeld){ PL.char.jump(); PL._jumpHeld = true; }
-    if(!keys.Space) PL._jumpHeld = false;
+    if(down('jump') && onG && PL.alive && !PL._jumpHeld){ PL.char.jump(); PL._jumpHeld = true; }
+    if(!down('jump')) PL._jumpHeld = false;
     PL.char.pos(cpos);
     const feet = cpos.y - HALF;
     PL.speed = Math.hypot(PL.vel.x, PL.vel.z);
@@ -6694,14 +7331,14 @@ function updatePlayer(dt, t){
     PL.eye.y = Math.abs(ty - PL.eye.y) > 0.6 ? ty : lerp(PL.eye.y, ty, 1 - Math.exp(-dt*18));
     camera.position.copy(PL.eye);
     camera.position.addScaledVector(right, Math.cos(PL.bob*0.5)*0.02*(PL.speed/4.3)*(1-PL.ads));
-    if(cpos.y < -10) { PL.hp = 0; }
+    if(cpos.y < -10) hurt(1000, 'fall');
   }
   // ориентация: взгляд + отдача + тряска
   const sh = PL.shake*PL.shake;
   const sx = (Math.sin(t*37.1)+Math.sin(t*23.7))*0.5*sh*0.05, sy = (Math.sin(t*31.3)+Math.cos(t*19.9))*0.5*sh*0.05;
   _e.set(PL.pitch + PL.recoil*0.9 + sx, PL.yaw + sy, (Math.sin(t*27.0))*sh*0.03 + (PL.alive?0:0.5), 'YXZ');
   camera.quaternion.setFromEuler(_e);
-  const fovT = lerp(72, 50, PL.ads) + (PL.sprint ? 4 : 0);
+  const fovT = lerp(SET.fov, SET.fov*0.69, PL.ads) + (PL.sprint ? 4 : 0);
   if(Math.abs(camera.fov - fovT) > 0.05){ camera.fov = lerp(camera.fov, fovT, 1 - Math.exp(-dt*12)); camera.updateProjectionMatrix(); }
 }
 function footstep(c, k){
@@ -6713,10 +7350,16 @@ function footstep(c, k){
   SND.step(surf === 'sand' ? 'conc' : surf, k);
 }
 /** Урон игроку. */
-function hurt(dmg, kind){
+const DEATH_BY = { fire:'сгорел', blast:'погиб от взрыва', fall:'разбился' };
+function hurt(dmg, kind, from){
   if(!PL.alive || PL.fly) return;
   PL.hp -= dmg; PL.damageFx = Math.min(1, PL.damageFx + dmg/40);
-  if(PL.hp <= 0){ PL.hp = 0; PL.alive = false; PL.deadT = 0; PL.killedBy = kind; }
+  if(from && dmg > 1) damageFrom(from);
+  if(PL.hp <= 0){
+    PL.hp = 0; PL.alive = false; PL.deadT = 0; PL.killedBy = kind;
+    SUPPLY.busy = false; WPN.reloadT = 0;
+    feed(`<b>${PL.team || 'Игрок'}</b> ${DEATH_BY[kind] || 'выбыл'}`);
+  }
 }
 
 // Оружие: автомат (хитскан с пробитием дерева), осколочная граната (тело
@@ -6724,7 +7367,21 @@ function hurt(dmg, kind){
 // волна, воронка в бетоне, гарь на стенах, дым, пожар.
 
 const V = (x=0,y=0,z=0)=> new THREE.Vector3(x,y,z);
-const WPN = { mag:30, magMax:30, reloadT:0, cool:0, fired:0, frags:3, fire:2, nadeCool:0, viewmodel:null, kick:0, stats:{shots:0} };
+// Боезапас конечный: 30 в магазине + 4 магазина, 2 осколочные, 1 зажигательная.
+// Пополнение — только у ящика на базе (клавиша F).
+const WPN = { mag:30, magMax:30, reserve:120, reserveMax:120, reloadT:0, reloadDur:2.4, cool:0, fired:0,
+  frags:2, fragsMax:2, fire:1, fireMax:1, nadeCool:0, viewmodel:null, kick:0, stats:{shots:0, hits:0} };
+const RELOAD_EMPTY = 2.9, RELOAD_TAC = 2.3;
+function startReload(){
+  if(WPN.reloadT > 0 || WPN.mag >= WPN.magMax || WPN.reserve <= 0) return false;
+  WPN.reloadDur = WPN.mag > 0 ? RELOAD_TAC : RELOAD_EMPTY;
+  WPN.reloadT = WPN.reloadDur; SND.reload && SND.reload(WPN.mag > 0);
+  return true;
+}
+function finishReload(){
+  const need = WPN.magMax - WPN.mag, take = Math.min(need, WPN.reserve);
+  WPN.mag += take; WPN.reserve -= take;
+}
 const GRENADES = [];
 
 /* ---------- модель автомата от первого лица ---------- */
@@ -6751,8 +7408,31 @@ function buildViewmodel(){
     transparent:true, opacity:.18, depthWrite:false}), 0, 0.076, -0.045);
   const dot = add(new THREE.CircleGeometry(0.0011, 10), new THREE.MeshBasicMaterial({color:0xff2a1a, depthTest:false}), 0, 0.075, -0.044);
   dot.userData.dot = true;
-  // магазин, рукоять, приклад
-  for(let i=0;i<3;i++) add(roundedBox(0.028, 0.07, 0.056, 0.006, 1), tan, 0, -0.068 - i*0.056, -0.05 + i*0.02, -0.33 - i*0.1);
+  // магазин — отдельная группа: при перезарядке его отстёгивают и меняют
+  const mag = new THREE.Group(); mag.position.set(0, -0.04, -0.055); G.add(mag);
+  { const parts = [];
+    for(let i=0;i<3;i++){ const g = roundedBox(0.028, 0.07, 0.056, 0.006, 1); g.rotateX(-0.33 - i*0.1); g.translate(0, -0.028 - i*0.056, 0.005 + i*0.02); parts.push(g); }
+    const m = new THREE.Mesh(mergeParts(parts), tan); mag.add(m); }
+  G.userData.mag = mag; G.userData.magRest = mag.position.clone();
+  // руки в перчатках: правая на рукояти, левая под цевьём
+  const glove = new THREE.MeshStandardMaterial({color:0x2b2c2a, roughness:.92, metalness:0});
+  const sleeve = new THREE.MeshStandardMaterial({color:0x3d4036, roughness:.95, metalness:0});
+  // предплечье уходит от запястья вниз-назад, к краю кадра (ось цилиндра — Y)
+  const hand = (fingersForward, armDir)=>{
+    const H = new THREE.Group();
+    const palm = new THREE.Mesh(roundedBox(0.05, 0.085, 0.095, 0.02, 2), glove); H.add(palm);
+    const fing = new THREE.Mesh(roundedBox(0.056, 0.03, 0.075, 0.012, 1), glove); fing.position.set(0, fingersForward ? 0.045 : -0.04, -0.01); H.add(fing);
+    const thumb = new THREE.Mesh(roundedBox(0.022, 0.022, 0.06, 0.009, 1), glove); thumb.position.set(-0.03, 0.03, -0.03); thumb.rotation.y = 0.4; H.add(thumb);
+    const d = new THREE.Vector3(...armDir).normalize();
+    const cuff = new THREE.Mesh(new THREE.CylinderGeometry(0.036, 0.034, 0.05, 12), glove);
+    cuff.quaternion.setFromUnitVectors(new THREE.Vector3(0,1,0), d); cuff.position.copy(d).multiplyScalar(0.06); H.add(cuff);
+    const arm = new THREE.Mesh(new THREE.CylinderGeometry(0.036, 0.044, 0.36, 12), sleeve);
+    arm.quaternion.setFromUnitVectors(new THREE.Vector3(0,1,0), d); arm.position.copy(d).multiplyScalar(0.26); H.add(arm);
+    return H;
+  };
+  const rh = hand(false, [0.25, -0.8, 0.55]); rh.position.set(0.012, -0.075, 0.1); rh.rotation.set(0.3, 0, 0.12); G.add(rh);
+  const lh = hand(true, [-0.45, -0.75, 0.5]); lh.position.set(-0.012, -0.04, -0.28); lh.rotation.set(-0.15, 0, -0.35); G.add(lh);
+  G.userData.lh = lh; G.userData.lhRest = lh.position.clone(); G.userData.lhRot = lh.rotation.clone();
   add(roundedBox(0.034, 0.095, 0.042, 0.01, 2), poly, 0, -0.066, 0.1, 0.32);
   add(new THREE.BoxGeometry(0.008, 0.028, 0.045), metal, 0, -0.042, 0.045);
   add(roundedBox(0.04, 0.07, 0.17, 0.014, 2), poly, 0, -0.03, 0.22, 0.08);
@@ -6760,12 +7440,12 @@ function buildViewmodel(){
     color:0xffc07a, transparent:true, blending:THREE.AdditiveBlending, depthWrite:false, opacity:0}));
   flash.position.set(0, 0.01, -0.68); G.add(flash);
   const flash2 = flash.clone(); flash2.rotation.y = Math.PI/2; flash2.material = flash.material; G.add(flash2);
-  G.userData.flash = flash.material;
+  G.userData.flash = flash.material; G.userData.flashMesh = flash;
   G.traverse(o=>{ if(o.isMesh){ o.castShadow = false; o.receiveShadow = false; o.frustumCulled = false; o.renderOrder = 10; } });
   // детали одного материала сливаются: 27 вызовов отрисовки → 7
   const groups = new Map();
   for(const m of [...G.children]){
-    if(!m.isMesh || m.userData.dot || m.material.transparent || !m.geometry.index) continue;
+    if(!m.isMesh || m.userData.dot || m.material.transparent || !m.geometry.index) continue;   // группы (магазин, руки) не сливаются
     if(!groups.has(m.material)) groups.set(m.material, []);
     m.updateMatrix();
     const g = m.geometry.clone().applyMatrix4(m.matrix);
@@ -6777,6 +7457,7 @@ function buildViewmodel(){
     mm.castShadow = false; mm.receiveShadow = false; mm.frustumCulled = false; mm.renderOrder = 10; G.add(mm);
   }
   G.userData.nomerge = true;
+  G.traverse(o=>{ if(o.isMesh) o.layers.set(LAYER_VM); });
   camera.add(G);
   return G;
 }
@@ -6823,7 +7504,7 @@ const BURN_FX = {
     });
     this.mesh = new THREE.Mesh(g, mat);
     this.mesh.frustumCulled = false; this.mesh.renderOrder = 12; this.mesh.visible = false;
-    this.mesh.userData.nomerge = true;
+    this.mesh.userData.nomerge = true; this.mesh.layers.set(LAYER_VM);
     camera.add(this.mesh);
     this.el = $('#burn'); this.msg = $('#burnmsg');
   },
@@ -6840,64 +7521,94 @@ function initWeapons(){
   WPN.viewmodel = buildViewmodel();
   BURN_FX.build();
   HOOKS.barrel = p => barrelExplode(p);
-  HOOKS.leak = (p, at)=> setTimeout(()=>{ if(!p.dead) addFire(V(p.center.x, p.center.y+0.2, p.center.z), {t:'p', p}, {I:0.6, fuel:30}); }, 400 + Math.random()*800);
+  HOOKS.leak = (p, at)=> later(0.4 + Math.random()*0.8, ()=>{ if(!p.dead) addFire(V(p.center.x, p.center.y+0.2, p.center.z), {t:'p', p}, {I:0.6, fuel:30}); });
 }
-const _dir = V(), _org = V(), _to = V(); new THREE.Quaternion();
+const _dir = V(), _org = V(), _to = V(), _end = V(), _mz = V(), _tmp = V(), _su = V(), _sv = V(), _up = V(0,1,0);
+const _seen = new Set();
+/** Отклонение внутри конуса с углом a: точка равномерно в круге, а не в кубе
+    (шум по каждой координате давал «квадратный» разброс). */
+function coneJitter(dir, a){
+  if(a <= 0) return dir;
+  _su.crossVectors(Math.abs(dir.y) < 0.99 ? _up : _tmp.set(1,0,0), dir).normalize();
+  _sv.crossVectors(dir, _su);
+  const r = Math.tan(a) * Math.sqrt(Math.random()), phi = Math.random()*Math.PI*2;
+  return dir.addScaledVector(_su, Math.cos(phi)*r).addScaledVector(_sv, Math.sin(phi)*r).normalize();
+}
 /* ---------- выстрел ---------- */
 function shoot(){
   WPN.mag--; WPN.cool = 1/11; WPN.fired++; WPN.stats.shots++;
   camera.getWorldPosition(_org);
   camera.getWorldDirection(_dir);
   const moving = clamp(PL.speed/4.3, 0, 1.5);
+  // полуугол конуса, рад: стоя ~0.15°, в движении и в прыжке — заметно шире
   const spread = (0.0025 + moving*0.012 + (PL.onGround?0:0.03)) * (1 - PL.ads*0.8) + Math.min(WPN.kick, 1)*0.01;
-  _dir.x += rnd(-spread, spread); _dir.y += rnd(-spread, spread); _dir.z += rnd(-spread, spread); _dir.normalize();
+  coneJitter(_dir, spread);
   _to.copy(_org).addScaledVector(_dir, 160);
   const hits = rayAll(_org, _to, GRP.STATIC|GRP.DYN|GRP.DEBRIS);
-  let power = 1.0, end = _to.clone();
-  const seen = new Set();
+  let power = 1.0, hitKind = 0;
+  _end.copy(_to);
+  _seen.clear();
   for(const h of hits){
     if(h.idx === -10) continue;                       // сам игрок
     const key = h.idx >= 0 ? h.idx : 'st'+h.p.x.toFixed(2)+h.p.z.toFixed(2);
-    if(seen.has(key) && h.idx >= 0) continue; seen.add(key);
+    if(_seen.has(key) && h.idx >= 0) continue; _seen.add(key);
     const r = bulletHit(h, _dir, power);
+    if(r.feedback) hitKind = Math.max(hitKind, r.feedback);
     power -= r.cost;
-    if(r.stop || power < 0.15){ end = h.p.clone(); break; }
+    if(r.stop || power < 0.15){ _end.copy(h.p); break; }
   }
+  if(hitKind) hitFeedback(hitKind);
   // дерево, пробитое насквозь, оставляет выходные отверстия — это делает bulletHit
   // трассер: каждый третий патрон
+  muzzleWorld(_mz);
   if(WPN.fired % 3 === 0){
-    const mz = muzzleWorld();
-    const d = end.clone().sub(mz), L = d.length();
-    FXS.spark.spawn({p: mz.clone().addScaledVector(d, 0.3/Math.max(L,1)), v: d.clone().normalize().multiplyScalar(260), life: Math.min(0.5, L/260), s0:0.05, s1:0.04, col:[1,0.8,0.5], a0:1, a1:0.6, drag:0});
+    const L = _tmp.copy(_end).sub(_mz).length();
+    _tmp.divideScalar(Math.max(L, 1e-3));
+    FXS.spark.spawn({p: _su.copy(_mz).addScaledVector(_tmp, 0.3), v: _sv.copy(_tmp).multiplyScalar(260), life: Math.min(0.5, L/260), s0:0.05, s1:0.04, col:[1,0.8,0.5], a0:1, a1:0.6, drag:0});
   }
   // вспышка, отдача, звук
-  WPN.viewmodel.userData.flash.opacity = 1; WPN.viewmodel.children.at(-1).rotation.z = Math.random()*3;
-  FXS.flashes.fire(muzzleWorld(), 0xffb060, 4, 7, 0.06);
+  WPN.viewmodel.userData.flash.opacity = 1; WPN.viewmodel.userData.flashMesh.rotation.z = Math.random()*3;
+  FXS.flashes.fire(_mz, 0xffb060, 4, 7, 0.06);
   PL.recoil += 0.012 + rnd(0, 0.006)*(1-PL.ads*0.5);
   PL.yaw += rnd(-25e-4, 0.0025);
   WPN.kick = Math.min(WPN.kick + 0.35, 2);
   SND.shot(null, true);
-  const mz = muzzleWorld();
-  FXS.smoke.spawn({p:mz, v:_dir.clone().multiplyScalar(0.6).add(V(0,0.3,0)), life:1.2, s0:0.05, s1:0.4, col:[0.5,0.5,0.5], a0:0.25, a1:0, drag:2});
+  FXS.smoke.spawn({p:_mz, v:_tmp.copy(_dir).multiplyScalar(0.6).add(_sv.set(0,0.3,0)), life:1.2, s0:0.05, s1:0.4, col:[0.5,0.5,0.5], a0:0.25, a1:0, drag:2});
   // гильза
-  const ej = V(0.06, 0.02, -0.05).applyQuaternion(camera.quaternion).add(camera.position);
-  FXS.splinters.spawn(ej, V(0.9,1.2,0.2).applyQuaternion(camera.quaternion).add(V(rnd(-0.3,.3),rnd(0,.4),rnd(-0.3,.3))), V(0.009,0.009,0.03), PL.eye.y - 1.6, 4);
+  _su.set(0.06, 0.02, -0.05).applyQuaternion(camera.quaternion).add(camera.position);
+  _sv.set(0.9,1.2,0.2).applyQuaternion(camera.quaternion).add(_tmp.set(rnd(-0.3,.3),rnd(0,.4),rnd(-0.3,.3)));
+  FXS.splinters.spawn(_su, _sv, CASE_SIZE, PL.eye.y - 1.6, 4);
 }
-function muzzleWorld(){ return V(0.0, 0.01, -0.66).applyMatrix4(WPN.viewmodel.matrixWorld); }
+const CASE_SIZE = V(0.009,0.009,0.03);
+function muzzleWorld(out = V()){ return out.set(0.0, 0.01, -0.66).applyMatrix4(WPN.viewmodel.matrixWorld); }
 
 /* ---------- граната ---------- */
-let nadeGeo = null;
+// Геометрия и материалы снарядов общие: раньше каждый бросок создавал новые
+// и не освобождал их — память росла с каждой гранатой.
+let NADE = null;
+function nadeAssets(){
+  if(NADE) return NADE;
+  const body = new THREE.SphereGeometry(0.045, 12, 10); body.scale(1, 1.25, 1);
+  NADE = {
+    frag: body, fragMat: cmat(0x3d4430, {roughness:.7, metalness:.3}),
+    lever: new THREE.BoxGeometry(0.012, 0.07, 0.02),
+    bottle: new THREE.CylinderGeometry(0.04, 0.045, 0.22, 10),
+    bottleMat: new THREE.MeshStandardMaterial({color:0x3f5a2a, roughness:.1, metalness:.1, transparent:true, opacity:.8}),
+    rag: new THREE.CylinderGeometry(0.015, 0.02, 0.08, 6), ragMat: cmat(0xd9c9a0,{roughness:1})
+  };
+  return NADE;
+}
 function throwNade(kind){
   camera.getWorldDirection(_dir);
   const p = V(0.18, -0.1, -0.4).applyMatrix4(camera.matrixWorld);
+  const A_ = nadeAssets();
   let mesh;
   if(kind === 'frag'){
-    if(!nadeGeo){ nadeGeo = new THREE.SphereGeometry(0.045, 12, 10); nadeGeo.scale(1, 1.25, 1); }
-    mesh = new THREE.Mesh(nadeGeo, cmat(0x3d4430, {roughness:.7, metalness:.3}));
-    const lever = new THREE.Mesh(new THREE.BoxGeometry(0.012, 0.07, 0.02), M.steel); lever.position.set(0.035, 0.03, 0); mesh.add(lever);
+    mesh = new THREE.Mesh(A_.frag, A_.fragMat);
+    const lever = new THREE.Mesh(A_.lever, M.steel); lever.position.set(0.035, 0.03, 0); mesh.add(lever);
   } else {
-    mesh = new THREE.Mesh(new THREE.CylinderGeometry(0.04, 0.045, 0.22, 10), new THREE.MeshStandardMaterial({color:0x3f5a2a, roughness:.1, metalness:.1, transparent:true, opacity:.8}));
-    const rag = new THREE.Mesh(new THREE.CylinderGeometry(0.015, 0.02, 0.08, 6), cmat(0xd9c9a0,{roughness:1})); rag.position.y = 0.14; mesh.add(rag);
+    mesh = new THREE.Mesh(A_.bottle, A_.bottleMat);
+    const rag = new THREE.Mesh(A_.rag, A_.ragMat); rag.position.y = 0.14; mesh.add(rag);
   }
   mesh.castShadow = true; mesh.position.copy(p); scene.add(mesh);
   const speed = kind === 'frag' ? 14 : 12;
@@ -6932,6 +7643,8 @@ function molotov(rec, p){
 }
 /* ---------- взрыв ---------- */
 const CRATERS = [];
+let _craterPlane = null;
+const CHUNK_S = [0.07, 0.1, 0.13, 0.16], _chunkGeo = [];
 function blastFX(p, big=1){
   FXS.flashes.fire(p.clone().add(V(0,0.4,0)), 0xffb070, 90*big, 22*big, 0.35);
   FXS.flash.spawn({p: p.clone().add(V(0,0.3,0)), life:0.12, s0:4*big, s1:6*big, col:[1,0.85,0.6], a0:1, a1:0});
@@ -6944,10 +7657,13 @@ function blastFX(p, big=1){
     const d = V(rnd(-1,1), rnd(0,1.2), rnd(-1,1)).normalize();
     FXS.spark.spawn({p: p.clone(), v: d.multiplyScalar(rnd(8,26)), life:rnd(0.3,0.9), s0:0.05, s1:0.015, col:[1,0.75,0.35], a0:1, a1:0, g:-9.8, drag:0.6});
   }
-  for(let i=0;i<Math.round(16*big);i++){
-    const d = V(rnd(-1,1), rnd(0.1,1), rnd(-1,1)).normalize(); const g = rnd(0.08,0.18);
-    FXS.smoke.spawn({p: p.clone().addScaledVector(d, rnd(0.2,0.8)), v: d.multiplyScalar(rnd(1,4)).add(V(0,1,0)), life:rnd(5,10),
-      s0:rnd(0.8,1.4)*big, s1:rnd(3,5)*big, col:[g,g*0.95,g*0.9], a0:0.55, a1:0, drag:1.2, turb:0.4, fadeIn:0.1});
+  // дым тротила — тёмно-серый с бурым, горячий снизу; уходит вверх и копится под перекрытием
+  const ceil = fireCeil(p);
+  for(let i=0;i<Math.round(18*big);i++){
+    const d = V(rnd(-1,1), rnd(0.1,1), rnd(-1,1)).normalize(); const g = rnd(0.1,0.22);
+    FXS.smoke.spawn({p: p.clone().addScaledVector(d, rnd(0.2,0.8)), v: d.multiplyScalar(rnd(1,4)).add(V(0,1,0)), life:rnd(7,12),
+      s0:rnd(0.8,1.4)*big, s1:rnd(3.5,5.5)*big, col:[g*1.06,g,g*0.88], a0:0.75, a1:0, aPow:1.6, drag:1.2, g:0.18, turb:0.4, fadeIn:0.1,
+      heat:1.3, ceil, wind:0.01});
   }
   const fy = floorBelow(p);
   if(p.y - fy < 1.2){
@@ -6976,7 +7692,9 @@ function grenadeExplode(p, big=1){
 /** Воронка в бетоне: выбитая чаша (декаль с нормалями), вал крошки, куски плиты. */
 function crater(p, big){
   const R = rnd(1.0, 1.35)*big;
-  const dec = new THREE.Mesh(new THREE.PlaneGeometry(R*2, R*2), M.crater);
+  if(!_craterPlane) _craterPlane = new THREE.PlaneGeometry(1, 1);
+  const dec = new THREE.Mesh(_craterPlane, M.crater);
+  dec.scale.set(R*2, R*2, 1); dec.userData.sharedGeo = true;
   dec.rotation.x = -Math.PI/2; dec.rotation.z = rnd(0,6.28); dec.position.set(p.x, p.y+0.006, p.z);
   dec.receiveShadow = true; dec.renderOrder = 1; dec.userData.nomerge = true; scene.add(dec);
   // вал выброса: неровные куски бетона по кольцу, один меш
@@ -6993,11 +7711,12 @@ function crater(p, big){
   const rim = new THREE.Mesh(BGU.mergeGeometries(parts, false), M.conc);
   rim.castShadow = true; rim.receiveShadow = true; rim.userData.nomerge = true; scene.add(rim);
   CRATERS.push(dec, rim);
-  while(CRATERS.length > 32){ const o = CRATERS.shift(); o.removeFromParent(); o.geometry.dispose(); }
+  while(CRATERS.length > 32){ const o = CRATERS.shift(); o.removeFromParent(); if(!o.userData.sharedGeo) o.geometry.dispose(); }
   // куски плиты — телами, крошка — частицами
   for(let i=0;i<Math.round(5*big);i++){
-    const s = rnd(0.07, 0.16);
-    const m = new THREE.Mesh(new THREE.DodecahedronGeometry(s, 0), M.conc); m.userData.ownGeo = true;
+    const gi = Math.floor(Math.random()*CHUNK_S.length), s = CHUNK_S[gi];
+    if(!_chunkGeo[gi]) _chunkGeo[gi] = new THREE.DodecahedronGeometry(s, 0);
+    const m = new THREE.Mesh(_chunkGeo[gi], M.conc);
     m.position.set(p.x + rnd(-0.3,0.3), p.y + 0.15, p.z + rnd(-0.3,0.3)); m.castShadow = true; scene.add(m);
     addDynamic(m, {shape:'sphere', radius:s*0.85, mass: s*s*s*2400*4, vel:V(rnd(-5,5), rnd(4,9), rnd(-5,5)), spin:V(rnd(-9,9),rnd(-9,9),rnd(-9,9)),
       life: sr(30,50), surf:'conc', group:GRP.DEBRIS, restitution:0.25});
@@ -7013,9 +7732,10 @@ function scorch(p, big){
     FXS.decals.add(h.p, h.n, (2.4 + rnd(0,0.8))*big*(0.5+k*0.5), 4, null);
   }
 }
+let _shellGeo = null;
 function barrelExplode(p){
   const c = p.center.clone();
-  setTimeout(()=>{
+  later(0.06, ()=>{
     blastFX(c, 1.3);
     explode(c, {radius: 7, power: 1.25, fire: 1.0});
     const fy = floorBelow(c);
@@ -7023,11 +7743,13 @@ function barrelExplode(p){
     ignitePlayer(c, 3.6, 1);
     scorch(c, 1.3);
     // бочку разрывает: обечайка улетает вверх
-    const m = new THREE.Mesh(new THREE.CylinderGeometry(0.29, 0.26, 0.6, 14, 1, true), cmat(0x3a1a12,{roughness:.8, metalness:.4, side:THREE.DoubleSide}));
-    m.position.copy(c).add(V(0,0.3,0)); m.userData.ownGeo = true; m.castShadow = true; scene.add(m);
+    if(!_shellGeo) _shellGeo = new THREE.CylinderGeometry(0.29, 0.26, 0.6, 14, 1, true);
+    const m = new THREE.Mesh(_shellGeo, cmat(0x3a1a12,{roughness:.8, metalness:.4, side:THREE.DoubleSide}));
+    m.position.copy(c).add(V(0,0.3,0)); m.castShadow = true; scene.add(m);
     addDynamic(m, {shape:'cyl', size:[0.56,0.6,0.56], mass:8, vel:V(rnd(-2,2), rnd(8,12), rnd(-2,2)), spin:V(rnd(-6,6),rnd(-6,6),rnd(-6,6)),
       life:60, surf:'metal', group:GRP.DYN});
-  }, 60);
+    feed(`взрыв бочки с топливом`);
+  });
 }
 
 /* ---------- кадр ---------- */
@@ -7037,13 +7759,11 @@ function updateWeapons(dt, t){
   const vm = WPN.viewmodel;
   if(vm.userData.flash.opacity > 0) vm.userData.flash.opacity = Math.max(0, vm.userData.flash.opacity - dt*28);
   // перезарядка
-  if(WPN.reloadT > 0){ WPN.reloadT -= dt; if(WPN.reloadT <= 0){ WPN.mag = WPN.magMax; } }
-  const canFire = PL.alive && !PL.fly && INPUT.locked && WPN.reloadT <= 0 && !PL.sprint;
+  if(WPN.reloadT > 0){ WPN.reloadT -= dt; if(WPN.reloadT <= 0){ WPN.reloadT = 0; finishReload(); } }
+  const canFire = PL.alive && !PL.fly && INPUT.locked && WPN.reloadT <= 0 && !PL.sprint && !SUPPLY.busy;
   if(canFire && INPUT.mouseDown && WPN.cool <= 0){
-    if(WPN.mag > 0) shoot(); else { WPN.cool = 0.25; SND.click(); WPN.reloadT = 2.2; }
+    if(WPN.mag > 0) shoot(); else { WPN.cool = 0.3; SND.click(); if(!startReload()) INPUT.mouseDown = false; }
   }
-  // гранаты — учебные, запас восполняется
-  WPN.frags = Math.min(3, WPN.frags + dt/6); WPN.fire = Math.min(2, WPN.fire + dt/9);
   for(let i=GRENADES.length-1;i>=0;i--){
     const g = GRENADES[i]; g.fuse -= dt;
     if(g.kind === 'frag' && g.fuse <= 0){
@@ -7055,19 +7775,45 @@ function updateWeapons(dt, t){
   // положение модели: прицеливание, бег, покачивание, отдача, перезарядка
   swayT += dt*(PL.speed > 0.5 ? (PL.sprint ? 11 : 8) : 1.5);
   const ads = PL.ads, run = PL.sprint ? 1 : 0;
-  const rl = WPN.reloadT > 0 ? Math.sin(clamp(1 - WPN.reloadT/2.2, 0, 1)*Math.PI) : 0;
+  const rl = WPN.reloadT > 0 ? Math.sin(clamp(1 - WPN.reloadT/WPN.reloadDur, 0, 1)*Math.PI) : 0;
   const bobA = (PL.speed > 0.5 ? 0.012 : 0.003) * (1-ads*0.85);
   vm.position.set(lerp(0.12, 0.0, ads) + Math.cos(swayT)*bobA + run*0.05,
                   lerp(-0.14, -0.075, ads) - Math.abs(Math.sin(swayT))*bobA - rl*0.12 - run*0.03,
                   lerp(-0.42, -0.24, ads) + WPN.kick*0.012 + PL.recoil*0.4);
   vm.rotation.set(PL.recoil*1.4 - rl*0.6 + run*-0.3, lerp(0.035, 0, ads) + run*0.6 + rl*0.3, rl*0.5 + run*0.25);
   vm.visible = PL.alive && !PL.fly;
+  animateReload(vm);
+}
+/** Перезарядка: левая рука отстёгивает магазин, он уходит вниз, новый
+    поднимается и защёлкивается; на пустом — ещё и рывок затвора. */
+const _rkA = new THREE.Vector3(), _rkB = new THREE.Vector3();
+function animateReload(vm){
+  const U = vm.userData, mag = U.mag, lh = U.lh; if(!mag || !lh) return;
+  const r = WPN.reloadT > 0 ? clamp(1 - WPN.reloadT/WPN.reloadDur, 0, 1) : 1;
+  const ss = smoothstep;
+  const out = ss(0.14, 0.38, r), back = ss(0.42, 0.64, r);
+  const drop = WPN.reloadT > 0 ? out*(1 - back) : 0;
+  mag.position.copy(U.magRest); mag.position.y -= drop*0.34; mag.position.z += drop*0.06;
+  mag.rotation.x = drop*0.7; mag.visible = !(r > 0.38 && r < 0.42);
+  // левая рука: цевьё → горловина магазина → вниз с магазином → обратно → цевьё
+  const well = _rkA.set(-0.01, -0.12, -0.05), rest = U.lhRest;
+  let k;
+  if(WPN.reloadT <= 0){ lh.position.copy(rest); lh.rotation.copy(U.lhRot); return; }
+  if(r < 0.14){ k = ss(0, 0.14, r); lh.position.lerpVectors(rest, well, k); }
+  else if(r < 0.64){ lh.position.copy(well); lh.position.y -= drop*0.34; lh.position.z += drop*0.06; }
+  else if(WPN.reloadDur > RELOAD_TAC + 0.1 && r < 0.9){
+    // пустой магазин: рука к рукоятке затвора и рывок назад
+    const cp = _rkB.set(0.035, 0.03, 0.02);
+    k = ss(0.64, 0.74, r); lh.position.lerpVectors(well, cp, k);
+    lh.position.z += ss(0.76, 0.82, r)*(1 - ss(0.84, 0.9, r))*0.07;
+  } else { const r0 = WPN.reloadDur > RELOAD_TAC + 0.1 ? 0.9 : 0.64; k = ss(r0, Math.min(1, r0 + 0.2), r); lh.position.lerpVectors(WPN.reloadDur > RELOAD_TAC + 0.1 ? _rkB.set(0.035, 0.03, 0.02) : well, rest, k); }
+  lh.rotation.set(U.lhRot.x + drop*0.5, U.lhRot.y, U.lhRot.z*(1 - Math.min(1, drop*2)));
 }
 function weaponKey(code){
-  if(!PL.alive || PL.fly) return;
-  if(code === 'KeyR' && WPN.reloadT <= 0 && WPN.mag < WPN.magMax){ WPN.reloadT = 2.2; SND.click(); }
-  if(code === 'KeyG' && WPN.frags >= 1 && WPN.nadeCool <= 0){ WPN.frags -= 1; WPN.nadeCool = 0.9; throwNade('frag'); }
-  if(code === 'KeyT' && WPN.fire >= 1 && WPN.nadeCool <= 0){ WPN.fire -= 1; WPN.nadeCool = 0.9; throwNade('fire'); }
+  if(!PL.alive || PL.fly || SUPPLY.busy) return;
+  if(isKey('reload', code)) startReload();
+  if(isKey('frag', code) && WPN.frags >= 1 && WPN.nadeCool <= 0){ WPN.frags -= 1; WPN.nadeCool = 0.9; throwNade('frag'); }
+  if(isKey('molotov', code) && WPN.fire >= 1 && WPN.nadeCool <= 0){ WPN.fire -= 1; WPN.nadeCool = 0.9; throwNade('fire'); }
 }
 /** Урон игроку от ударной волны: с проверкой укрытия. */
 function playerBlast(p, R, P){
@@ -7077,10 +7823,316 @@ function playerBlast(p, R, P){
   const block = rayFirst(p.clone().add(V(0,0.2,0)), eye, GRP.STATIC);
   const cover = block && block.f < 0.95 ? 0.3 : 1;
   const k = Math.pow(1 - d/R, 1.4);
-  hurt(160*P*k*cover, 'blast');
+  hurt(160*P*k*cover, 'blast', p);
   if(k*cover > 0.25) PL.deaf = Math.min(1, PL.deaf + k*cover);
   const push = V().subVectors(eye, p).setY(0).normalize().multiplyScalar(6*k*cover);
   PL.vel.add(push);
+}
+
+/* ============================================================================
+   ДВЕРИ: открыть / закрыть (E), выбить с разбега, прострелить, сорвать взрывом.
+   Все полотна — один InstancedMesh (ручки и пробоины — ещё по одному), тела —
+   кинематические боксы Bullet: держат игрока, пули и обломки.
+============================================================================ */
+const DOOR_LEAVES = [];
+const DOOR_T = 0.042, DOOR_OPEN = 1.62, DOOR_HP = 240;
+const DOOR = { leaf:null, handle:null, holes:null, holeN:0, mat:null, moving:false, wasMoving:false, tr:null };
+const _dm = new THREE.Matrix4(), _dq = new THREE.Quaternion(), _dp = new THREE.Vector3(), _ds = new THREE.Vector3(),
+      _dY = new THREE.Vector3(0,1,0), _dl = new THREE.Vector3(), _dq2 = new THREE.Quaternion(), _dzero = new THREE.Matrix4().makeScale(0,0,0);
+const DOOR_HOLES_MAX = 400;
+function buildDoors(){
+  if(!DOORS.length) return;
+  const leafGeo = new THREE.BoxGeometry(DOOR_T, 1, 1); leafGeo.translate(0, 0.5, 0.5);
+  // полотно — крашеная филёнчатая дверь поверх фанеры: текстура дерева слабо читается сквозь краску
+  DOOR.mat = new THREE.MeshStandardMaterial({ color:0x8c7c66, roughness:.7, metalness:0,
+    map: M.plywood.map, normalMap: M.plywood.normalMap, normalScale: new THREE.Vector2(0.35, 0.35) });
+  DOOR.leaf = new THREE.InstancedMesh(leafGeo, DOOR.mat, DOORS.length);
+  const hp = [];
+  for(const sx of [-1, 1]){
+    const rose = new THREE.CylinderGeometry(0.028, 0.028, 0.012, 12); rose.rotateZ(Math.PI/2); rose.translate(sx*(DOOR_T/2 + 0.006), 0, 0); hp.push(rose);
+    const lever = new THREE.BoxGeometry(0.018, 0.018, 0.13); lever.translate(sx*(DOOR_T/2 + 0.04), 0, -0.05); hp.push(lever);
+    const neck = new THREE.CylinderGeometry(0.008, 0.008, 0.04, 8); neck.rotateZ(Math.PI/2); neck.translate(sx*(DOOR_T/2 + 0.022), 0, 0); hp.push(neck);
+  }
+  DOOR.handle = new THREE.InstancedMesh(mergeParts(hp), M.chrome, DOORS.length);
+  const holeMat = M.decal.clone();
+  holeMat.map = M.decal.map.clone(); holeMat.map.needsUpdate = true;
+  holeMat.map.repeat.set(0.25, 0.5); holeMat.map.offset.set(0, 0.5);      // ячейка 0 атласа — пробоина в дереве
+  DOOR.holes = new THREE.InstancedMesh(new THREE.PlaneGeometry(1, 1), holeMat, DOOR_HOLES_MAX);
+  DOOR.holes.count = 0; DOOR.holes.visible = false;
+  for(const im of [DOOR.leaf, DOOR.handle, DOOR.holes]){
+    im.instanceMatrix.setUsage(THREE.DynamicDrawUsage); im.frustumCulled = false; im.userData.nomerge = true;
+    im.receiveShadow = true; scene.add(im);
+  }
+  DOOR.leaf.castShadow = true;
+  DOOR.holes.layers.set(LAYER_FX);
+  let i = 0;
+  for(const d of DOORS){
+    const lw = (d.w || DOOR_W) - 0.03, lh = DOOR_H - 0.03;
+    const ux = Math.sin(d.ang), uz = Math.cos(d.ang);
+    const hinge = new THREE.Vector3(d.x - ux*lw/2, d.y + 0.012, d.z - uz*lw/2);
+    // двери, выходящие наружу, закрыты; внутренние — кто как оставил
+    const outer = Math.abs(Math.abs(d.x) - BX1) < 0.05 || Math.abs(Math.abs(d.z) - BZ1) < 0.05;
+    const r = rnd2(), open = outer ? 0 : (r < 0.45 ? 0 : (r < 0.7 ? DOOR_OPEN*0.35 : DOOR_OPEN)) * (rnd2() < 0.5 ? -1 : 1);
+    DOOR_LEAVES.push({ i: i++, d, lw, lh, hinge, ang: d.ang, open, target: open, speed: 2.6, hp: DOOR_HP, broken: false,
+      body: null, idx: -1, holes: [], n: new THREE.Vector3(uz, 0, -ux), c: new THREE.Vector3(d.x, d.y + lh/2, d.z) });
+  }
+  for(const L of DOOR_LEAVES) doorPose(L);
+  DOOR.leaf.instanceMatrix.needsUpdate = DOOR.handle.instanceMatrix.needsUpdate = true;
+}
+/** Кинематические тела дверей (после Ammo). */
+function initDoorPhysics(){
+  DOOR.tr = new A.btTransform();
+  for(const L of DOOR_LEAVES){
+    L.idx = registerOwner({type:'door', d:L});
+    const shape = boxShape(DOOR_T/2, L.lh/2, L.lw/2);
+    doorWorld(L);
+    const body = makeBody(shape, 0, _dp, _dq, {friction:0.6});
+    body.setCollisionFlags(body.getCollisionFlags() | 2);        // CF_KINEMATIC_OBJECT
+    body.setActivationState(4);                                  // DISABLE_DEACTIVATION
+    body.setUserIndex(L.idx);
+    world.addRigidBody(body, GRP.STATIC, -1);
+    L.body = body;
+  }
+}
+/** Центр и поворот полотна в мире → _dp/_dq. */
+function doorWorld(L){
+  _dq.setFromAxisAngle(_dY, L.ang + L.open);
+  _dp.set(0, L.lh/2, L.lw/2).applyQuaternion(_dq).add(L.hinge);
+}
+function doorPose(L){
+  if(L.broken){ DOOR.leaf.setMatrixAt(L.i, _dzero); DOOR.handle.setMatrixAt(L.i, _dzero); return; }
+  _dq.setFromAxisAngle(_dY, L.ang + L.open);
+  _dm.compose(L.hinge, _dq, _ds.set(1, L.lh, L.lw));
+  DOOR.leaf.setMatrixAt(L.i, _dm);
+  _dp.set(0, 1.0, L.lw - 0.075).applyQuaternion(_dq).add(L.hinge);
+  _dm.compose(_dp, _dq, _ds.set(1,1,1));
+  DOOR.handle.setMatrixAt(L.i, _dm);
+  for(const h of L.holes) holePose(L, h);
+  if(L.body){
+    doorWorld(L);
+    const tr = DOOR.tr; tr.setIdentity();
+    PH.v1.setValue(_dp.x, _dp.y, _dp.z); tr.setOrigin(PH.v1);
+    PH.q1.setValue(_dq.x, _dq.y, _dq.z, _dq.w); tr.setRotation(PH.q1);
+    L.body.getMotionState().setWorldTransform(tr); L.body.setWorldTransform(tr);
+  }
+}
+function holePose(L, h){
+  if(L.broken){ DOOR.holes.setMatrixAt(h.k, _dzero); return; }
+  _dq.setFromAxisAngle(_dY, L.ang + L.open);
+  _dp.set(h.side*(DOOR_T/2 + 0.002), h.y, h.z).applyQuaternion(_dq).add(L.hinge);
+  _dq2.setFromAxisAngle(_dY, h.side > 0 ? Math.PI/2 : -Math.PI/2).premultiply(_dq);   // плоскость декали — по грани полотна
+  _dm.compose(_dp, _dq2, _ds.set(h.s, h.s, 1));
+  DOOR.holes.setMatrixAt(h.k, _dm);
+}
+function updateDoors(dt){
+  let moving = false;
+  for(const L of DOOR_LEAVES){
+    if(L.broken || L.open === L.target) continue;
+    const dA = L.target - L.open, stepA = L.speed*dt;
+    L.open = Math.abs(dA) <= stepA ? L.target : L.open + Math.sign(dA)*stepA;
+    if(L.open === L.target && L.speed > 6) SND.door(L.c, 'close');      // выбитая дверь бьётся о стену
+    else if(L.open === L.target && L.target === 0) SND.door(L.c, 'close');
+    doorPose(L); moving = true;
+  }
+  if(moving){ DOOR.leaf.instanceMatrix.needsUpdate = DOOR.handle.instanceMatrix.needsUpdate = true; if(DOOR.holes.count) DOOR.holes.instanceMatrix.needsUpdate = true; }
+  // тень двери пересчитываем, когда она остановилась, а не каждый кадр
+  if(DOOR.wasMoving && !moving && SUN_UP) renderer.shadowMap.needsUpdate = true;
+  DOOR.wasMoving = moving;
+}
+/** Дверь, на которую смотрит игрок (луч взгляда), или ближайшая в проёме. */
+function lookDoor(){
+  if(!DOOR_LEAVES.length || !PH.ready) return null;
+  camera.getWorldDirection(_dl);
+  _dp.copy(PL.eye).addScaledVector(_dl, 2.1);
+  const h = rayFirst(PL.eye, _dp, GRP.STATIC);
+  if(h && h.idx >= 0){ const o = PH.owners[h.idx]; if(o && o.type === 'door') return o.d; }
+  let best = null, bd = 1.8;
+  for(const L of DOOR_LEAVES){
+    if(Math.abs(PL.eye.y - (L.d.y + 1.6)) > 1.2) continue;
+    const dx = L.d.x - PL.eye.x, dz = L.d.z - PL.eye.z, dist = Math.hypot(dx, dz);
+    if(dist < bd && (dx*_dl.x + dz*_dl.z)/Math.max(dist, 1e-3) > 0.2){ bd = dist; best = L; }
+  }
+  if(best && h && h.f*2.1 < PL.eye.distanceTo(best.c) - 0.4) return null;   // между игроком и дверью стена
+  return best;
+}
+function useDoor(){
+  if(!PL.alive || PL.fly) return;
+  const L = lookDoor(); if(!L || L.broken) return;
+  const side = Math.sign((PL.eye.x - L.c.x)*L.n.x + (PL.eye.z - L.c.z)*L.n.z) || 1;
+  const away = -side*DOOR_OPEN;
+  if(PL.sprint && PL.speed > 4.2 && Math.abs(L.open) < 0.2){
+    // выбить с разбега: замок вылетает, полотно распахивается и бьётся о стену
+    L.target = away; L.speed = 12; L.hp -= 150;
+    PL.shake = Math.min(1, PL.shake + 0.35); PL.vel.multiplyScalar(0.35);
+    SND.door(L.c, 'kick');
+    for(let i=0;i<6;i++) FXS.splinters.spawn(_dp.copy(L.c).addScaledVector(L.n, side*0.05), _dl.set(rnd(-1,1), rnd(0,1.5), rnd(-1,1)).addScaledVector(L.n, -side*2), _ds.set(rnd(0.03,0.08), 0.006, 0.012), L.d.y, 6);
+    FXS.dust.spawn({p: L.c.clone(), v: L.n.clone().multiplyScalar(-side), life: 1.6, s0: 0.3, s1: 1.4, col:[0.7,0.66,0.6], a0: 0.35, a1: 0, drag: 2});
+    if(L.hp <= 0) breakDoor(L, _dl.copy(L.n).multiplyScalar(-side), 1.2);
+    else feed('дверь выбита');
+    return;
+  }
+  L.speed = 2.6;
+  if(Math.abs(L.target) > 0.1){ L.target = 0; }
+  else { L.target = away; SND.door(L.c, 'open'); }
+}
+/** Пуля: пробоины с двух сторон, щепа; изрешечённая дверь слетает с петель. */
+function doorBulletHit(L, hit, dir, power){
+  _dq.setFromAxisAngle(_dY, L.ang + L.open).invert();
+  _dl.copy(hit.p).sub(L.hinge).applyQuaternion(_dq);                 // точка в системе полотна
+  const y = clamp(_dl.y, 0.05, L.lh - 0.05), z = clamp(_dl.z, 0.05, L.lw - 0.05);
+  const s = rnd(0.07, 0.1);
+  for(const side of [-1, 1]){
+    const k = DOOR.holeN++ % DOOR_HOLES_MAX;
+    const old = DOOR_LEAVES.find(o=> o.holes.some(h=> h.k === k));
+    if(old) old.holes = old.holes.filter(h=> h.k !== k);
+    const h = {k, side, y, z, s: side === Math.sign(_dl.x || 1) ? s : s*1.4};
+    L.holes.push(h); holePose(L, h);
+  }
+  DOOR.holes.count = Math.min(DOOR.holeN, DOOR_HOLES_MAX); DOOR.holes.visible = true;
+  DOOR.holes.instanceMatrix.needsUpdate = true;
+  const fl = L.d.y;
+  for(let i=0;i<3;i++) FXS.splinters.spawn(hit.p, _dp.copy(dir).multiplyScalar(rnd(0.5,2.5)).add(_ds.set(rnd(-0.6,.6),rnd(0,1),rnd(-0.6,.6))),
+    _ds.set(rnd(0.03,0.08), rnd(0.003,0.007), rnd(0.006,0.014)), fl, rnd(5,10));
+  SND.hit(hit.p, 'wood');
+  L.hp -= 34*power*0.45;
+  if(L.hp <= 0) breakDoor(L, dir, power*0.6);
+  return {stop:false, cost:0.18, surf:'wood'};
+}
+/** Полотно срывается с петель и летит телом Bullet. */
+function breakDoor(L, dir, power){
+  if(L.broken) return;
+  doorWorld(L);
+  const pos = _dp.clone(), q = _dq.clone();
+  L.broken = true;
+  if(L.body){ removeBody(L.body); L.body = null; }
+  PH.owners[L.idx] = null;
+  doorPose(L); for(const h of L.holes) holePose(L, h);
+  DOOR.leaf.instanceMatrix.needsUpdate = DOOR.handle.instanceMatrix.needsUpdate = DOOR.holes.instanceMatrix.needsUpdate = true;
+  const m = new THREE.Mesh(new THREE.BoxGeometry(DOOR_T, L.lh, L.lw), DOOR.mat);
+  m.userData.ownGeo = true; m.position.copy(pos); m.quaternion.copy(q); m.castShadow = true; m.receiveShadow = true;
+  scene.add(m);
+  addDynamic(m, {size:[DOOR_T, L.lh, L.lw], mass:22, vel: dir.clone().multiplyScalar(3 + power*5).add(V(0, 0.8, 0)),
+    spin: V(rnd(-2,2), rnd(-3,3), rnd(-2,2)), life: 1e9, keep: true, surf:'wood', group: GRP.DYN, friction: 0.8});
+  SND.door(pos, 'kick');
+  renderer.shadowMap.needsUpdate = SUN_UP;
+  DEST.broken++;
+  feed('дверь сорвана с петель');
+}
+/** Взрыв рядом: дверь распахивает ударной волной или срывает. */
+function doorBlast(p, R, P){
+  for(const L of DOOR_LEAVES){
+    if(L.broken) continue;
+    const d = L.c.distanceTo(p); if(d > R) continue;
+    const k = 1 - d/R;
+    L.hp -= 700*P*k*k;
+    const dir = V().subVectors(L.c, p).setY(0).normalize();
+    if(L.hp <= 0) breakDoor(L, dir, 1 + 2*k*P);
+    else { const side = Math.sign(dir.dot(L.n)) || 1; L.target = side*DOOR_OPEN; L.speed = 14; }
+  }
+}
+
+/* ============================================================================
+   ЯЩИКИ С БОЕПРИПАСАМИ: по одному в центре каждой базы, общие для команд.
+   F рядом с ящиком — пополнить магазины и гранаты (1.6 с, стрелять нельзя).
+============================================================================ */
+const AMMO_BOXES = [];
+const SUPPLY = { busy:false, t:0, dur:1.6, box:null };
+let _ammoTex = null;
+function ammoStencil(){
+  if(_ammoTex) return _ammoTex;
+  const W = 512, H = 256, [c, x] = cv(W, H);
+  x.fillStyle = '#4c5436'; x.fillRect(0,0,W,H);
+  // потёки и выцветание краски
+  const q = (a,b)=> a + rnd2()*(b-a);
+  for(let i=0;i<260;i++){ x.fillStyle = `rgba(${q(20,90)|0},${q(30,90)|0},${q(15,50)|0},${q(0.04,0.12)})`; x.fillRect(q(0,W), q(0,H), q(4,60), q(2,14)); }
+  x.strokeStyle = 'rgba(20,22,14,.55)'; x.lineWidth = 6; x.strokeRect(10, 10, W-20, H-20);
+  x.fillStyle = 'rgba(226,220,196,.88)'; x.textAlign = 'center';
+  x.font = '700 52px "Arial Narrow",Arial,sans-serif'; x.fillText('БОЕПРИПАСЫ', W/2, 96);
+  x.font = '600 30px "Arial Narrow",Arial,sans-serif'; x.fillText('5,45×39 · 4 МАГ. · РГД-5 ×2', W/2, 146);
+  x.font = '600 24px ui-monospace,Consolas,monospace'; x.fillText('ALPHA · DELTA · ПАРТ. 07-26', W/2, 196);
+  x.globalCompositeOperation = 'destination-out';
+  for(let i=0;i<700;i++){ x.fillStyle = `rgba(0,0,0,${Math.random()*0.35})`; x.fillRect(Math.random()*W, Math.random()*H, 1+Math.random()*6, 1+Math.random()*3); }
+  x.globalCompositeOperation = 'destination-over'; x.fillStyle = '#4c5436'; x.fillRect(0,0,W,H);
+  _ammoTex = new THREE.CanvasTexture(c); _ammoTex.colorSpace = THREE.SRGBColorSpace; _ammoTex.anisotropy = MAXA();
+  _ammoTex.userData.mat = new THREE.MeshStandardMaterial({ map: _ammoTex, roughness:.78, metalness:.05 });
+  return _ammoTex;
+}
+function ammoBox(x, y, z, rotY){
+  const G = new THREE.Group();
+  const paint = ammoStencil().userData.mat;
+  const L = 1.05, Wd = 0.56, Hb = 0.42;
+  const body = new THREE.Mesh(roundedBox(L, Hb, Wd, 0.018, 1), paint); body.position.y = 0.1 + Hb/2; G.add(body);
+  for(const sz of [-1, 1]){                                          // полозья
+    const skid = new THREE.Mesh(new THREE.BoxGeometry(L + 0.04, 0.1, 0.09), M.woodDark); skid.position.set(0, 0.05, sz*(Wd/2 - 0.08)); G.add(skid);
+  }
+  for(const sx of [-1, 1]){                                          // ручки-скобы и защёлки
+    const handle = new THREE.Mesh(new THREE.TorusGeometry(0.06, 0.012, 6, 10, Math.PI), M.steel);
+    handle.position.set(sx*(L/2 + 0.012), 0.1 + Hb*0.62, 0); handle.rotation.set(0, Math.PI/2, Math.PI); G.add(handle);
+    const latch = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.09, 0.02), M.steel); latch.position.set(sx*0.32, 0.1 + Hb - 0.03, Wd/2 + 0.01); G.add(latch);
+  }
+  // крышка — на петлях у задней кромки, открывается при пополнении
+  const lidPivot = new THREE.Group(); lidPivot.position.set(0, 0.1 + Hb, -Wd/2);
+  const lid = new THREE.Mesh(roundedBox(L + 0.01, 0.06, Wd + 0.01, 0.015, 1), paint); lid.position.set(0, 0.03, Wd/2);
+  lidPivot.add(lid); lidPivot.userData.nomerge = true; G.add(lidPivot);
+  G.position.set(x, y, z); G.rotation.y = rotY; shadowAll(G); scene.add(G);
+  addAABB(x, y + 0.26, z, ...(Math.abs(Math.sin(rotY)) > 0.7 ? [Wd, 0.52, L] : [L, 0.52, Wd]), 0, 'wood');
+  AMMO_BOXES.push({ p: new THREE.Vector3(x, y + 0.5, z), lid: lidPivot, open: 0 });
+}
+function nearestBox(){
+  if(!PL.alive || PL.fly) return null;
+  let best = null, bd = 1.9;
+  for(const b of AMMO_BOXES){
+    const d = Math.hypot(b.p.x - PL.eye.x, b.p.z - PL.eye.z);
+    if(d < bd && Math.abs(PL.eye.y - b.p.y) < 1.8){ bd = d; best = b; }
+  }
+  return best;
+}
+const supplyFull = ()=> WPN.reserve >= WPN.reserveMax && WPN.frags >= WPN.fragsMax && WPN.fire >= WPN.fireMax && WPN.mag >= WPN.magMax;
+function trySupply(){
+  if(SUPPLY.busy) return;
+  const b = nearestBox(); if(!b) return;
+  if(supplyFull()){ feed('боезапас полон'); return; }
+  SUPPLY.busy = true; SUPPLY.t = 0; SUPPLY.box = b; WPN.reloadT = 0; INPUT.mouseDown = false;
+  SND.supply(b.p);
+}
+function updateSupply(dt){
+  for(const b of AMMO_BOXES){
+    const want = SUPPLY.busy && SUPPLY.box === b ? 1 : 0;
+    if(b.open !== want){ b.open = clamp(b.open + (want ? 3 : -2)*dt, 0, 1); b.lid.rotation.x = -b.open*1.9; }
+  }
+  if(!SUPPLY.busy) return;
+  const b = SUPPLY.box;
+  if(!PL.alive || PL.fly || Math.hypot(b.p.x - PL.eye.x, b.p.z - PL.eye.z) > 2.4){ SUPPLY.busy = false; return; }
+  SUPPLY.t += dt;
+  if(SUPPLY.t >= SUPPLY.dur){
+    SUPPLY.busy = false;
+    WPN.mag = WPN.magMax; WPN.reserve = WPN.reserveMax; WPN.frags = WPN.fragsMax; WPN.fire = WPN.fireMax;
+    SND.click();
+    feed('боезапас пополнен: 5 магазинов, гранаты');
+  }
+}
+
+/* ============================================================================
+   АДАПТАЦИЯ ГЛАЗА: внутри дома днём экспозиция плавно растёт (глаз
+   привыкает к полумраку), на выходе в светлый ангар — быстро падает.
+   Замкнутость пространства — по короткой «звезде» лучей вокруг камеры.
+============================================================================ */
+const EXPO = { base: 1, eye: 1, target: 1, t: 0 };
+const _eyeDirs = [[1,0,0],[-1,0,0],[0,0,1],[0,0,-1],[0.7,0,0.7],[-0.7,0,-0.7],[0.7,0,-0.7],[-0.7,0,0.7]].map(a=> new THREE.Vector3(...a));
+function updateEye(dt){
+  EXPO.t -= dt;
+  if(EXPO.t <= 0 && PH.ready){
+    EXPO.t = 0.25;
+    const p = camera.position; let enc = 0;
+    if(rayFirst(p, _dp.set(p.x, p.y + 6, p.z), GRP.STATIC)) enc += 3;
+    for(const d of _eyeDirs) if(rayFirst(p, _dp.copy(p).addScaledVector(d, 6), GRP.STATIC)) enc += 1;
+    const e = enc/11;
+    const day = clamp(SUN_ELEV*3 + 0.25, 0, 1);
+    EXPO.target = 1 + e*e*0.95*day;
+  }
+  const rate = EXPO.target > EXPO.eye ? 0.8 : 2.4;
+  EXPO.eye = lerp(EXPO.eye, EXPO.target, 1 - Math.exp(-dt*rate));
+  renderer.toneMappingExposure = EXPO.base * SET.exp * EXPO.eye;
 }
 
 // Команды: флаги на мачтах (ткань Bullet), точки возрождения, миникарта
@@ -7152,6 +8204,11 @@ function drawMinimap(cv, team, selected, player){
     const z0 = st.side==='n' ? BZ0-1.9 : BZ1+1.9, z1 = st.side==='n' ? BZ0-7.3 : BZ1+7.3;
     const [p0,q0] = P(st.x-0.6, Math.min(z0,z1)); x.fillStyle = 'rgba(150,160,170,0.5)'; x.fillRect(p0, q0, 1.2*s, Math.abs(z1-z0)*s);
   }
+  // ящики с боеприпасами
+  for(const b of AMMO_BOXES){
+    const [px, pz] = P(b.p.x, b.p.z);
+    x.fillStyle = '#c9b25a'; x.fillRect(px-6, pz-4, 12, 8); x.strokeStyle = '#1a1a14'; x.lineWidth = 1.5; x.strokeRect(px-6, pz-4, 12, 8);
+  }
   // флаги и точки
   for(const key of ['ALPHA','DELTA']){
     const T = TEAMS[key];
@@ -7190,7 +8247,8 @@ function spawnFromClick(team, px, pz){
 
 window.__BGU = BGU;
 const frame = ()=> new Promise(r=> requestAnimationFrame(()=> setTimeout(r, 0)));
-const status = t => { const el = $('#g_status'); if(el) el.textContent = t; };
+const BOOT = { t0: performance.now(), marks: [] };
+const status = t => { const el = $('#g_status'); if(el) el.textContent = t; BOOT.marks.push([t, Math.round(performance.now() - BOOT.t0)]); };
 const STATE = { team:'ALPHA', spawn:null, playing:false, started:false, menu:true, fps:0 };
 
 async function build(){
@@ -7200,6 +8258,8 @@ async function build(){
   status('Небо и окружение…'); await frame();
   buildSky(); buildEnvironment();
   status('Процедурные текстуры: OSB, бетон, металл…'); await frame();
+  await texCacheOpen();
+  installTexCache();
   buildAllMaterials();
   buildLights();
   initFX();
@@ -7207,6 +8267,7 @@ async function build(){
   buildHangar(); buildRoof(); buildLamps(); buildServices(); buildNightLighting();
   status('Шут-хаус: каркас, обшивка, лестницы…'); await frame();
   buildHouse();
+  buildDoors();
   status('Базы ALPHA / DELTA, укрытия, техника…'); await frame();
   buildLayout();
   buildFloor();
@@ -7215,14 +8276,18 @@ async function build(){
   flushBuckets();
   buildShafts(); buildWindowShafts(); buildDust();
   const baked = bakeScene();
+  buildShadowProxy();
   scene.traverse(o=>{ if(o.isMesh && o.userData.glass && !o.userData.glassReg){ o.userData.glassReg = true; } });
   for(const o of collectGlass()) registerGlass(o, {hp:1});
+  instanceGlass();
   scene.traverse(o=>{ if(o.isMesh) ensureColor(o); });
   buildGrid();
   status('Физика Bullet (ammo.js)…'); await frame();
   await initPhysics();
   const nStatic = buildStaticWorld();
   initDestructiblePhysics();
+  initDoorPhysics();
+  HOOKS.doorBlast = doorBlast;
   for(const d of DYN_PROPS){
     const rec = addDynamic(d.mesh, {shape:d.shape, size:d.size, mass:d.mass, surf:d.surf, friction:d.friction, restitution:d.restitution,
       group:GRP.DYN, life:1e9, keep:true, linDamp:0.05, angDamp:0.3});
@@ -7235,13 +8300,17 @@ async function build(){
   HOOKS.playerBlast = (p, R, P)=>{ playerBlast(p, R, P); pushLamps(p, R*2.5, P); };
   PH.onContact = onContact;
   buildComposer();
+  scene.traverse(o=>{ if(o.isLight) o.layers.enable(LAYER_VM); });
+  fxLayer(scene);
   applyDaylight(DAY.t);
   renderer.shadowMap.needsUpdate = true;
   // стартовый вид: над картой, на здание
   camera.position.set(-24, 7.5, -22); camera.lookAt(0, 2, 0);
   PL.yaw = Math.atan2(24, 22) + Math.PI; PL.pitch = -0.2;
   PL.flyPos.copy(camera.position); PL.fly = true; PL.char.enable(false);
-  window.ANGAR = api({baked, nStatic});
+  window.ANGAR = api({baked, nStatic, boot: BOOT.marks, texCache: TEXCACHE});
+  // текстуры, которых не было в кэше, сохраняются в фоне
+  setTimeout(()=> texCacheFlush(), 4000);
   setupUI();
   status('');
   if(!DEBUG.has('norun')) loop();
@@ -7336,8 +8405,12 @@ function updateBurning(dt, t){
    сначала отключается экранный AO, затем плавно снижается разрешение
    рендера (до Q.minPR от номинала). Когда запас появляется — всё
    возвращается обратно. */
-const DYNRES = { max: renderer.getPixelRatio(), pr: renderer.getPixelRatio(), ema: 16.7, t: -3, lock: DEBUG.has('fixedres') };
+const DYNRES = { max: renderer.getPixelRatio(), pr: renderer.getPixelRatio(), ema: 16.7, t: -3, lock: DEBUG.has('fixedres'),
+  slow: 0, fast: 0, li: 0, levels: [] };
 DYNRES.min = Math.max(0.5, DYNRES.max*Q.minPR);
+// Несколько фиксированных ступеней вместо шага 0.1: каждая смена разрешения
+// пересоздаёт буферы всех эффектов (фриз), поэтому меняем редко и с запасом.
+for(const k of [1, 0.85, 0.72, 0]){ const v = Math.max(DYNRES.min, DYNRES.max*k); if(!DYNRES.levels.some(l=> Math.abs(l - v) < 0.04)) DYNRES.levels.push(v); }
 function setRenderScale(pr){
   DYNRES.pr = pr;
   renderer.setPixelRatio(pr);
@@ -7346,25 +8419,35 @@ function setRenderScale(pr){
 }
 function adaptQuality(realDt){
   if(DYNRES.lock || document.hidden) return;
-  DYNRES.ema = lerp(DYNRES.ema, Math.min(realDt, 0.1)*1000, 0.06);
+  DYNRES.ema = lerp(DYNRES.ema, Math.min(realDt, 0.1)*1000, 0.03);
   DYNRES.t += realDt;
   const budget = 1000/Q.target, P = getPasses();
-  if(DYNRES.t > 1.2 && DYNRES.ema > budget*1.1){
-    DYNRES.t = 0;
-    if(P.aoPass && P.aoPass.enabled) P.aoPass.enabled = false;
-    else if(DYNRES.pr > DYNRES.min + 0.01) setRenderScale(Math.max(DYNRES.min, DYNRES.pr - (DYNRES.ema > budget*1.7 ? 0.2 : 0.1)));
-  } else if(DYNRES.t > 5 && DYNRES.ema < budget*0.7){
-    DYNRES.t = 0;
-    if(DYNRES.pr < DYNRES.max - 0.01) setRenderScale(Math.min(DYNRES.max, DYNRES.pr + 0.1));
+  // гистерезис: вниз — кадр дороже бюджета на 20% три секунды подряд,
+  // вверх — запас больше трети бюджета десять секунд подряд
+  DYNRES.slow = DYNRES.ema > budget*1.2 ? DYNRES.slow + realDt : 0;
+  DYNRES.fast = DYNRES.ema < budget*0.62 ? DYNRES.fast + realDt : 0;
+  if(DYNRES.slow > 3 && DYNRES.t > 4){
+    DYNRES.t = 0; DYNRES.slow = 0;
+    if(P.aoPass && P.aoPass.enabled) P.aoPass.enabled = false;          // выключение AO буферы не трогает
+    else if(DYNRES.li < DYNRES.levels.length - 1) setRenderScale(DYNRES.levels[++DYNRES.li]);
+  } else if(DYNRES.fast > 10 && DYNRES.t > 10){
+    DYNRES.t = 0; DYNRES.fast = 0;
+    if(DYNRES.li > 0) setRenderScale(DYNRES.levels[--DYNRES.li]);
     else if(P.aoPass && !P.aoPass.enabled) P.aoPass.enabled = true;
   }
 }
+/** Игровое время: идёт только вне меню (на паузе огонь, дым и ветер стоят). */
+let GAME_T = 0;
 function step(dt){
-  const t = performance.now()/1000;
+  GAME_T += dt;
+  const t = GAME_T;
   resetDebrisBudget();
+  tickTimers(dt);
   updateWind(t);
+  updateDoors(dt);
   if(PH.ready) stepPhysics(dt, WIND.vec);
   updatePlayer(dt, t);
+  updateSupply(dt);
   updateWeapons(dt);
   updateFire(dt, t);
   flushDestruction();
@@ -7375,7 +8458,7 @@ function step(dt){
   if(PL.alive && !PL.fly && PL.burn < 0.02 && PL.hp < 100 && PL.hp > 0) PL.hp = Math.min(100, PL.hp + dt*2.5);
   if(!PL.alive && STATE.playing){
     PL.deadT += dt;
-    if(PL.deadT > 2.2 && !STATE.menu){ document.exitPointerLock(); openMenu('dead'); }
+    if(PL.deadT > 2.2 && !STATE.menu){ openMenu('dead'); document.exitPointerLock(); }
   }
   // сутки длятся минуты: пересчёт всего освещения 10 раз в секунду незаметен
   if(!DAY.paused){ DAY.t = DAY.t + dt*DAY.speed; _dayAcc += dt; if(_dayAcc >= 0.1){ _dayAcc = 0; applyDaylight(DAY.t); } }
@@ -7391,9 +8474,11 @@ function step(dt){
   const sunK = clamp(DAY.elev*3 + 0.15, 0, 1);
   for(const g of GATES){ g.plane.material.color.setRGB(lerp(0.03,0.8,sunK), lerp(0.04,0.77,sunK), lerp(0.08,0.72,sunK)); g.beam.intensity = 7*sunK; }
   for(const sp of TEAM_SPOTS) sp.intensity = 10*DAY.lamp;
-  // дым освещён тем же светом, что и сцена: ночью он не светится сам
-  const k = clamp(0.25 + DAY.lamp*0 + (1 - DAY.lamp)*0.75, 0.22, 1);
+  // дым освещён тем же светом, что и сцена: рассеянный + солнце сквозь проёмы; ночью сам не светится
+  const k = clamp(0.25 + (1 - DAY.lamp)*0.75, 0.22, 1)*0.85;
   FXU.uAmb.value.setRGB(k, k*0.98, k*0.95);
+  FXU.uSunDir.value.copy(SUN_DIR);
+  FXU.uSunCol.value.copy(sun.color).multiplyScalar(sun.intensity*0.07);
   // Тени: статика — по сдвигу солнца; разрушение — сразу; летящие обломки —
   // несколько раз в секунду; флаги (ткань) — редко. Огонь сам по себе тени
   // не меняет, поэтому пожар больше не перерисовывает карту теней каждый кадр.
@@ -7403,6 +8488,7 @@ function step(dt){
   if(!SUN_UP){}                     // ночью тень от солнца не видна — карту не трогаем
   else if(active && shadowTick % (Q.lights >= 6 ? 2 : 4) === 0) renderer.shadowMap.needsUpdate = true;
   else if(FLAG_SHADOWS && shadowTick % 15 === 0) renderer.shadowMap.needsUpdate = true;
+  updateEye(dt);
   SND.listener(); SND.ambienceTick(WIND.speed);
   if(SND.ok && SND.lp){ SND.lp.frequency.setTargetAtTime(lerp(20000, 500, PL.deaf), SND.ctx.currentTime, 0.1); }
   updateHUD(dt);
@@ -7410,6 +8496,12 @@ function step(dt){
 function loop(){
   requestAnimationFrame(loop);
   const real = clock.getDelta();
+  // Меню: симуляция стоит (не горим, гранаты не взрываются, HP не растёт),
+  // эффекты не считаются — на экране последний кадр, размытый CSS-фильтром.
+  if(STATE.menu){
+    if(STATE.needFrame){ STATE.needFrame = false; renderer.info.reset(); getComposer().render(); }
+    return;
+  }
   const dt = Math.min(real, 0.05);
   step(dt);
   renderer.info.reset();
@@ -7430,6 +8522,7 @@ addEventListener('resize', ()=>{
   camera.aspect = innerWidth/innerHeight; camera.updateProjectionMatrix();
   renderer.setSize(innerWidth, innerHeight);
   const c = getComposer(); if(c) c.setSize(innerWidth, innerHeight);
+  STATE.needFrame = true;
 });
 
 /* ============================================================================
@@ -7463,30 +8556,82 @@ function setupUI(){
   $('#team_DELTA').onclick = ()=> selTeam('DELTA');
   $('#minimap').onclick = e=>{
     const r = e.target.getBoundingClientRect();
-    const sx = e.target.width/r.width;
-    const sp = spawnFromClick(STATE.team, (e.clientX-r.left)*sx, (e.clientY-r.top)*sx);
+    // canvas вписан с object-fit: contain — учитываем поля по краям
+    const k = Math.min(r.width/e.target.width, r.height/e.target.height);
+    const ox = (r.width - e.target.width*k)/2, oy = (r.height - e.target.height*k)/2;
+    const sp = spawnFromClick(STATE.team, (e.clientX-r.left-ox)/k, (e.clientY-r.top-oy)/k);
     if(sp){ STATE.spawn = sp; renderMap(); }
   };
   $('#go').onclick = ()=> deploy();
   $('#spectate').onclick = ()=> spectate();
-  $('#resume').onclick = ()=> { closeMenu(); renderer.domElement.requestPointerLock(); };
+  $('#resume').onclick = ()=> resume();
+  $('#fullscreen').onclick = ()=> toggleFullscreen();
+  $('#tab_map').onclick = ()=> menuTab('map');
+  $('#tab_set').onclick = ()=> menuTab('set');
+  document.addEventListener('fullscreenchange', onFullscreen);
   selTeam('ALPHA');
   INPUT.onLock = locked=>{
-    if(locked){ closeMenu(); }
-    else if(STATE.playing && !STATE.menu){ openMenu('pause'); }
+    if(locked){ menuMsg(''); closeMenu(); }
+    else if(STATE.playing && !STATE.menu){ openMenu(PL.alive ? 'pause' : 'dead'); }
+  };
+  INPUT.onLockError = ()=>{
+    // меню не закрываем, пока курсор не захвачен: иначе игрок застревает без мыши
+    if(!STATE.menu) openMenu(PL.alive ? 'pause' : 'dead');
+    menuMsg('Браузер ещё не вернул курсор после Esc — нажмите «Продолжить» через секунду.');
   };
   INPUT.onKey = (code, e)=>{
     if(code === 'F3'){ e.preventDefault(); const el = $('#fps'); el.style.display = el.style.display === 'none' ? 'block' : 'none'; }
     if(!INPUT.locked) return;
+    // при захваченной клавиатуре Esc приходит странице, а не браузеру
+    if(code === 'Escape'){ document.exitPointerLock(); return; }
     weaponKey(code);
-    if(code === 'KeyF'){ setFly(!PL.fly); }
-    if(code === 'KeyM'){ document.exitPointerLock(); openMenu('pause'); }
-    if(code === 'KeyN'){ DAY.t = nextPhase(DAY.t); applyDaylight(DAY.t); renderer.shadowMap.needsUpdate = true; }
-    if(code === 'KeyP'){ DAY.paused = !DAY.paused; }
+    if(isKey('fly', code)){ setFly(!PL.fly); }
+    if(isKey('use', code)){ useDoor(); }
+    if(isKey('supply', code)){ trySupply(); }
+    if(isKey('menu', code)){ document.exitPointerLock(); openMenu('pause'); }
+    if(isKey('phase', code)){ DAY.t = nextPhase(DAY.t); applyDaylight(DAY.t); renderer.shadowMap.needsUpdate = true; }
+    if(isKey('daypause', code)){ DAY.paused = !DAY.paused; }
     if(code === 'BracketRight'){ DAY.speed *= 2; }
     if(code === 'BracketLeft'){ DAY.speed /= 2; }
-    if(code === 'KeyH'){ $('#hints').classList.toggle('hide'); }
+    if(isKey('hints', code)){ $('#hints').classList.toggle('hide'); }
   };
+  setupSettings();
+  renderKeyHelp();
+  buildCompass();
+  STATE.needFrame = true;
+}
+function menuMsg(t){ $('#m_msg').textContent = t; }
+function menuTab(which){
+  $('#tab_map').classList.toggle('sel', which === 'map');
+  $('#tab_set').classList.toggle('sel', which === 'set');
+  $('#mappane').style.display = which === 'map' ? 'block' : 'none';
+  $('#settings').style.display = which === 'set' ? 'block' : 'none';
+}
+/** Захват курсора. Меню закрывается только по факту захвата (pointerlockchange). */
+function requestLock(){
+  const el = renderer.domElement;
+  menuMsg('');
+  try{
+    const r = el.requestPointerLock();
+    if(r && typeof r.catch === 'function') r.catch(()=>{ if(!INPUT.locked && INPUT.onLockError) INPUT.onLockError(); });
+  }catch(e){ if(INPUT.onLockError) INPUT.onLockError(); }
+}
+async function toggleFullscreen(){
+  if(document.fullscreenElement){ try{ await document.exitFullscreen(); }catch(e){} return; }
+  try{ await document.documentElement.requestFullscreen({navigationUI:'hide'}); }
+  catch(e){ menuMsg('Полноэкранный режим недоступен в этом окне.'); }
+}
+async function onFullscreen(){
+  KB.locked = false;
+  const kb = navigator.keyboard;
+  if(document.fullscreenElement && kb && kb.lock){
+    try{ await kb.lock(); KB.locked = true; }catch(e){}
+  } else if(kb && kb.unlock) kb.unlock();
+  $('#fullscreen').textContent = document.fullscreenElement ? 'ОКОННЫЙ РЕЖИМ' : 'ПОЛНЫЙ ЭКРАН';
+  menuMsg(KB.locked ? 'Клавиатура захвачена: Ctrl тоже приседает. Выход из полного экрана — удерживать Esc.'
+    : (document.fullscreenElement ? 'Полный экран без захвата клавиатуры: присед — только ' + keyName(KEYMAP.crouch) + '.' : ''));
+  renderKeyHelp();
+  STATE.needFrame = true;
 }
 function nextPhase(t){
   const stops = [0.02, 0.25, 0.52, 0.61, 0.70, 0.82, 0.97];
@@ -7494,51 +8639,241 @@ function nextPhase(t){
   return stops[0] + 1;
 }
 function deploy(){
-  SND.init(); SND.resume();
+  SND.init(); SND.resume(); applySettings();
   const T = TEAMS[STATE.team], sp = STATE.spawn || T.spawns[0];
   PL.team = STATE.team; PL.spawn = sp;
   spawnAt(sp, T.side < 0 ? -Math.PI/2 : Math.PI/2);
-  WPN.mag = WPN.magMax; WPN.reloadT = 0;
+  WPN.mag = WPN.magMax; WPN.reserve = WPN.reserveMax; WPN.frags = WPN.fragsMax; WPN.fire = WPN.fireMax;
+  WPN.reloadT = 0; SUPPLY.busy = false;
   $('#hud_emblem').src = emblemDataURL(STATE.team, 64);
   $('#hud_team').textContent = `${STATE.team} · ${sp.id} ${sp.name}`;
   STATE.playing = true; STATE.started = true;
-  closeMenu();
-  renderer.domElement.requestPointerLock();
+  miniBg(true);
+  feed(`<b>${STATE.team}</b> в бою · точка ${sp.id}`);
+  $('#resume').style.display = 'inline-block';
+  requestLock();
 }
 function spectate(){
-  SND.init(); SND.resume();
+  SND.init(); SND.resume(); applySettings();
   STATE.playing = true; setFly(true);
-  closeMenu(); renderer.domElement.requestPointerLock();
+  requestLock();
 }
+function resume(){ SND.resume(); requestLock(); }
 function openMenu(mode){
   STATE.menu = true;
   $('#menu').style.display = 'flex'; $('#menu').dataset.mode = mode;
   $('#resume').style.display = (mode === 'pause' && STATE.started && PL.alive) ? 'inline-block' : 'none';
   $('#menu_title').textContent = mode === 'dead' ? 'ВЫ ВЫБЫЛИ' : (mode === 'pause' ? 'ПАУЗА' : 'ANGAR-07');
   $('#hud').style.display = 'none';
+  INPUT.mouseDown = false; INPUT.rmb = false;
+  for(const k in keys) keys[k] = false;
+  // на паузе мир стоит: звук тоже (огонь, ветер, эхо)
+  if(SND.ctx && SND.ctx.state === 'running') SND.ctx.suspend();
   if(STATE.renderMap) STATE.renderMap();
+  STATE.needFrame = true;
 }
-function closeMenu(){ STATE.menu = false; $('#menu').style.display = 'none'; $('#hud').style.display = 'block'; }
-let hudT = 0;
+function closeMenu(){
+  STATE.menu = false; $('#menu').style.display = 'none'; $('#hud').style.display = 'block';
+  SND.resume();
+  clock.getDelta();          // время, проведённое в меню, в симуляцию не попадает
+  HUD.dirty = true;
+}
+
+/* ---------- настройки ---------- */
+const TONE = { agx: THREE.AgXToneMapping, neutral: THREE.NeutralToneMapping, aces: THREE.ACESFilmicToneMapping };
+function applySettings(){
+  renderer.toneMapping = TONE[SET.tone] ?? THREE.AgXToneMapping;
+  if(SND.master) SND.master.gain.value = 0.8 * SET.vol/100;
+  camera.fov = SET.fov; camera.updateProjectionMatrix();
+}
+function setupSettings(){
+  const bindRange = (id, key, fmt)=>{
+    const el = $('#s_' + id), out = $('#o_' + id);
+    el.value = SET[key]; if(out) out.textContent = fmt(SET[key]);
+    el.oninput = ()=>{ SET[key] = +el.value; if(out) out.textContent = fmt(SET[key]); applySettings(); saveSettings(); STATE.needFrame = true; };
+  };
+  bindRange('sens', 'sens', v=> v.toFixed(2));
+  bindRange('ads', 'ads', v=> v.toFixed(2));
+  bindRange('fov', 'fov', v=> v + '°');
+  bindRange('vol', 'vol', v=> v + '%');
+  bindRange('exp', 'exp', v=> v.toFixed(2));
+  $('#s_inv').checked = SET.inv; $('#s_inv').onchange = ()=>{ SET.inv = $('#s_inv').checked; saveSettings(); };
+  $('#s_tone').value = SET.tone;
+  $('#s_tone').onchange = ()=>{ SET.tone = $('#s_tone').value; applySettings(); saveSettings(); STATE.needFrame = true; };
+  $('#s_reset').onclick = ()=>{ Object.assign(SET, SET_DEF, {keys:{}}); saveSettings(); rebuildKeymap(); setupSettings(); renderKeyHelp(); applySettings(); STATE.needFrame = true; };
+  renderBinds();
+  applySettings();
+}
+function renderBinds(){
+  const box = $('#binds'); box.innerHTML = '';
+  for(const [a, label] of ACTIONS){
+    const row = document.createElement('div'); row.className = 'bind';
+    const b = document.createElement('button'); b.textContent = keyName(KEYMAP[a]);
+    b.onclick = ()=>{
+      b.classList.add('wait'); b.textContent = '…';
+      const onMouse = e=>{ const c = MOUSE_CODE[e.button]; if(c){ e.preventDefault(); e.stopPropagation(); done(c); } };
+      const done = code=>{
+        INPUT.capture = null; removeEventListener('mousedown', onMouse, true);
+        if(code && code !== 'Escape' && !CTRL(code)){
+          // клавиша, уже занятая другим действием, переходит к нему от этого
+          for(const [o] of ACTIONS) if(o !== a && KEYMAP[o] === code) SET.keys[o] = KEYMAP[a];
+          SET.keys[a] = code;
+        }
+        rebuildKeymap(); saveSettings(); renderBinds(); renderKeyHelp();
+      };
+      setTimeout(()=> addEventListener('mousedown', onMouse, true), 0);
+      INPUT.capture = done;
+    };
+    const s = document.createElement('span'); s.textContent = label;
+    row.append(s, b); box.appendChild(row);
+  }
+}
+function renderKeyHelp(){
+  const K = a=> keyName(KEYMAP[a]);
+  const mv = [K('fwd'), K('left'), K('back'), K('right')];
+  const rows = [
+    [mv.every(k=> k.length === 1) ? mv.join('') : mv.join('/'), 'движение'],
+    [K('sprint'), 'бег'], [K('jump'), 'прыжок'],
+    [K('crouch') + (KB.locked ? ' / Ctrl' : ''), 'присесть'], ['ЛКМ', 'огонь'], ['ПКМ', 'прицел'],
+    [K('reload'), 'перезарядка'], [K('frag'), 'граната'], [K('molotov'), 'зажигательная'],
+    [K('use'), 'дверь · с разбега выбить'], [K('supply'), 'ящик: боезапас'], [K('fly'), 'полёт/ходьба'],
+    [K('menu'), 'меню / точка'], [`${K('phase')} / ${K('daypause')}`, 'время суток'], [K('hints'), 'подсказки'],
+    ['F3', 'FPS'], ['Esc', 'пауза']
+  ];
+  $('#keys').innerHTML = rows.map(([k, t])=> `<div><b>${k}</b>${t}</div>`).join('');
+  $('#burnkey').textContent = K('crouch');
+  $('#hints').innerHTML = `<b>ЛКМ</b> огонь — дерево пробивается насквозь · <b>${K('frag')}</b> граната · <b>${K('molotov')}</b> зажигательная<br>`
+    + `<b>${K('use')}</b> дверь (с разбега — выбить) · <b>${K('supply')}</b> у ящика на базе — боезапас · <b>${K('hints')}</b> скрыть`;
+}
+
+/* ---------- HUD: пишем в DOM только то, что изменилось ---------- */
+const HUD = { dirty:true, last:{}, t:0, el:null, miniT:0 };
+function hudSet(key, el, prop, val){
+  if(HUD.last[key] === val) return;
+  HUD.last[key] = val;
+  if(prop === 'text') el.textContent = val; else if(prop === 'html') el.innerHTML = val; else el.style[prop] = val;
+}
+function hudEls(){
+  if(HUD.el) return HUD.el;
+  const ids = ['hp_bar','hp_num','ammo','nades','dmg','cross','clock','dead','concuss','prompt','hitm','mini','feed'];
+  HUD.el = {}; for(const id of ids) HUD.el[id] = $('#' + id);
+  HUD.el.strip = $('#compass .strip');
+  HUD.el.arcs = [...document.querySelectorAll('#dmgdir i')].map(el=>({el, t:0, a:0}));
+  return HUD.el;
+}
 function updateHUD(dt){
-  hudT += dt; if(hudT < 0.05) return; hudT = 0;
-  $('#hp_bar').style.width = PL.hp + '%';
-  $('#hp_num').textContent = Math.ceil(PL.hp);
-  $('#ammo').textContent = WPN.reloadT > 0 ? 'ПЕРЕЗАРЯДКА' : `${WPN.mag} / ∞`;
-  $('#nades').textContent = `G ×${Math.floor(WPN.frags)}   T ×${Math.floor(WPN.fire)}`;
-  $('#dmg').style.opacity = Math.min(1, PL.damageFx*0.9 + (PL.hp < 35 ? 0.25 : 0));
-  $('#cross').style.opacity = PL.fly || !PL.alive ? 0 : (1 - PL.ads*0.85);
-  const spread = 8 + Math.min(PL.speed, 6)*2.5 + WPN.kick*6;
-  $('#cross').style.setProperty('--g', spread + 'px');
-  $('#clock').textContent = `${dayClock(DAY.t)} · ${phaseName(DAY.t)}${PL.fly ? ' · НАБЛЮДАТЕЛЬ' : ''}`;
-  $('#dead').style.opacity = PL.alive ? 0 : 1;
-  $('#concuss').style.opacity = PL.deaf*0.7;
+  const E = hudEls();
+  // компас и дуги урона — каждый кадр (плавность), остальное — 20 раз в секунду
+  const bearing = ((-PL.yaw*180/Math.PI) % 360 + 360) % 360;
+  hudSet('cmp', E.strip, 'transform', `translateX(${(COMPASS.w/2 - (bearing + 360)*COMPASS.px).toFixed(1)}px)`);
+  for(const a of E.arcs){
+    if(a.t <= 0) continue;
+    a.t = Math.max(0, a.t - dt*0.9);
+    const rel = PL.yaw - a.a;
+    a.el.style.transform = `rotate(${(rel*180/Math.PI).toFixed(1)}deg)`;
+    a.el.style.opacity = Math.min(1, a.t*1.4).toFixed(2);
+  }
+  HUD.t += dt; if(HUD.t < 0.05 && !HUD.dirty) return;
+  const step = Math.max(HUD.t, 0.05); HUD.t = 0; HUD.dirty = false;
+  const hp = Math.ceil(PL.hp);
+  hudSet('hpw', E.hp_bar, 'width', hp + '%');
+  hudSet('hp', E.hp_num, 'text', String(hp));
+  hudSet('ammo', E.ammo, 'text', PL.fly ? '' : (WPN.reloadT > 0 ? 'ПЕРЕЗАРЯДКА' : `${WPN.mag} / ${WPN.reserve}`));
+  hudSet('nades', E.nades, 'text', PL.fly ? '' : `${keyName(KEYMAP.frag)} ×${WPN.frags}   ${keyName(KEYMAP.molotov)} ×${WPN.fire}`);
+  hudSet('dmg', E.dmg, 'opacity', Math.min(1, PL.damageFx*0.9 + (PL.hp < 35 ? 0.25 : 0)).toFixed(2));
+  hudSet('cro', E.cross, 'opacity', String(PL.fly || !PL.alive ? 0 : +(1 - PL.ads*0.85).toFixed(2)));
+  const spread = Math.round(8 + Math.min(PL.speed, 6)*2.5 + WPN.kick*6);
+  if(HUD.last.spread !== spread){ HUD.last.spread = spread; E.cross.style.setProperty('--g', spread + 'px'); }
+  hudSet('clock', E.clock, 'text', `${dayClock(DAY.t)} · ${phaseName(DAY.t)}${PL.fly ? ' · НАБЛЮДАТЕЛЬ' : ''}`);
+  hudSet('dead', E.dead, 'opacity', PL.alive ? '0' : '1');
+  hudSet('conc', E.concuss, 'opacity', (PL.deaf*0.7).toFixed(2));
+  // подсказка взаимодействия: ящик, дверь
+  let pr = '', bar = -1;
+  if(PL.alive && !PL.fly){
+    if(SUPPLY.busy){ pr = 'ПОПОЛНЕНИЕ БОЕЗАПАСА…'; bar = SUPPLY.t/SUPPLY.dur; }
+    else if(nearestBox()) pr = `<b>${keyName(KEYMAP.supply)}</b>` + (supplyFull() ? 'БОЕЗАПАС ПОЛОН' : 'ПОПОЛНИТЬ БОЕЗАПАС');
+    else {
+      const d = lookDoor();
+      if(d) pr = d.broken ? 'ДВЕРЬ ВЫБИТА' : `<b>${keyName(KEYMAP.use)}</b>${d.target > 0.5 ? 'ЗАКРЫТЬ ДВЕРЬ' : 'ОТКРЫТЬ ДВЕРЬ'}${PL.sprint ? ' · ВЫБИТЬ' : ''}`;
+    }
+  }
+  hudSet('pr', E.prompt, 'html', pr + (bar >= 0 ? `<div class="bar"><i style="width:${Math.round(bar*100)}%"></i></div>` : ''));
+  hudSet('pro', E.prompt, 'opacity', pr ? '1' : '0');
+  HUD.miniT += step;
+  if(HUD.miniT >= 0.1){ HUD.miniT = 0; drawMini(E.mini); }
+}
+/* ---------- компас: полоса с румбами, сдвиг по курсу ---------- */
+const COMPASS = { px: 2.4, w: 440 };
+function buildCompass(){
+  const strip = $('#compass .strip'); if(!strip) return;
+  const names = {0:'С', 45:'СВ', 90:'В', 135:'ЮВ', 180:'Ю', 225:'ЮЗ', 270:'З', 315:'СЗ'};
+  let html = '';
+  for(let d = 0; d <= 720; d += 15){
+    const n = names[d % 360];
+    html += `<span class="${n ? '' : 'm'}" style="left:${(d*COMPASS.px).toFixed(1)}px">${n || (d % 360)}</span>`;
+  }
+  strip.innerHTML = html;
+  const fit = ()=>{ const w = $('#compass').getBoundingClientRect().width; if(w) COMPASS.w = w; HUD.last.cmp = null; };
+  fit(); addEventListener('resize', fit);
+}
+/* ---------- миникарта в бою: статичный фон + огонь + игрок, повёрнута по взгляду ---------- */
+let _miniBg = null, _miniTeam = null;
+function miniBg(force){
+  if(_miniBg && !force && _miniTeam === STATE.team) return _miniBg;
+  const c = document.createElement('canvas'); c.width = 840; c.height = 640;
+  drawMinimap(c, STATE.team, null, null);
+  _miniBg = c; _miniTeam = STATE.team;
+  return c;
+}
+function drawMini(cv){
+  if(!cv || !STATE.playing) return;
+  const x = cv.getContext('2d'), W = cv.width, bg = miniBg();
+  const s = Math.min(840/(HW*2+4), 640/(HD*2+4)), zoom = 1.3;
+  const px = 420 + camera.position.x*s, pz = 320 + camera.position.z*s;
+  x.setTransform(1,0,0,1,0,0);
+  x.fillStyle = 'rgb(14,16,18)'; x.fillRect(0,0,W,W);
+  x.save(); x.translate(W/2, W/2); x.scale(zoom, zoom); x.rotate(PL.yaw); x.translate(-px, -pz);
+  x.drawImage(bg, 0, 0);
+  x.fillStyle = 'rgba(255,120,40,.9)';
+  for(const f of FIRES){ if(f.I < 0.2) continue; x.beginPath(); x.arc(420 + f.p.x*s, 320 + f.p.z*s, 1.5 + f.I*2.5, 0, 7); x.fill(); }
+  x.restore();
+  x.fillStyle = '#fff'; x.beginPath(); x.moveTo(W/2, W/2 - 13); x.lineTo(W/2 + 9, W/2 + 10); x.lineTo(W/2, W/2 + 5); x.lineTo(W/2 - 9, W/2 + 10); x.fill();
+  // «С» по краю — там, где на экране север
+  const r = W/2 - 18;
+  x.fillStyle = '#e8eaec'; x.font = '700 24px system-ui,sans-serif'; x.textAlign = 'center'; x.textBaseline = 'middle';
+  x.fillText('С', W/2 + Math.sin(PL.yaw)*r, W/2 - Math.cos(PL.yaw)*r);
+}
+/* ---------- лента событий ---------- */
+function feed(html){
+  const box = $('#feed'); if(!box) return;
+  const d = document.createElement('div'); d.innerHTML = html; box.prepend(d);
+  while(box.children.length > 5) box.lastChild.remove();
+  later(5.5, ()=> d.classList.add('fade'));
+  later(6.2, ()=> d.remove());
+}
+/* ---------- отметка попадания и направление урона ---------- */
+function hitFeedback(kind){
+  const el = hudEls().hitm;
+  el.classList.toggle('kill', kind >= 2);
+  el.style.transition = 'none'; el.style.opacity = '1';
+  void el.offsetWidth;
+  el.style.transition = 'opacity .28s ease-out .06s'; el.style.opacity = '0';
+  SND.hitmark(kind >= 2);
+}
+/** Дуга у прицела показывает, откуда прилетел урон. */
+function damageFrom(p){
+  if(!p) return;
+  const a = Math.atan2(-(p.x - PL.eye.x), -(p.z - PL.eye.z));      // yaw, при котором взгляд направлен на источник
+  const arcs = hudEls().arcs;
+  const slot = arcs.find(s=> s.t > 0 && Math.abs(Math.atan2(Math.sin(s.a - a), Math.cos(s.a - a))) < 0.4) || arcs.reduce((m, s)=> s.t < m.t ? s : m);
+  slot.a = a; slot.t = 1.6;
 }
 
 /* ---------- отладочный API (проверки из консоли и автотестов) ---------- */
 function api(stats){
   return {
-    THREE, scene, camera, renderer, PH, DEST, FIRES, PL, WPN, TEAMS, COLLIDERS, stats, keys, INPUT, DOORS, PITS, DYNRES,
+    THREE, scene, camera, renderer, PH, DEST, FIRES, PL, WPN, TEAMS, COLLIDERS, stats, keys, INPUT, DOORS, PITS, DYNRES, M,
+    DOOR_LEAVES, AMMO_BOXES, SUPPLY, SET, EXPO, useDoor, trySupply, lookDoor, openMenu, closeMenu, STATE,
     burn:(s=1)=> ignitePlayer(PL.eye, 1, s),
     step:(dt=1/60, n=1)=>{ for(let i=0;i<n;i++) step(dt); },
     render:()=> getComposer().render(),
@@ -7562,5 +8897,5 @@ function api(stats){
 
 build().catch(err=>{
   console.error(err);
-  $('#g_load').innerHTML = '<p style="color:#d9736b">Ошибка: ' + String(err && err.message || err) + '</p>';
+  if(!(err && err.angarShown)) fatal('Ошибка при сборке карты', String(err && err.message || err));
 });
