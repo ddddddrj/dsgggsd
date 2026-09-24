@@ -5,6 +5,7 @@ src/engine/lib/common.js
 src/engine/mounts.js
 src/engine/ctx.js
 src/engine/foley.js
+src/engine/gunshot.js
 src/engine/audio.js
 src/engine/fx.js
 src/engine/reticle.js

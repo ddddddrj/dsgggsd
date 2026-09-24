@@ -52,7 +52,7 @@ var UI = class {
       <div><kbd>Пробел</kbd>огонь (в прицеле — ЛКМ)</div><div><kbd>ПКМ</kbd><kbd>F</kbd>прицелиться</div>
       <div><kbd>R</kbd>перезарядка</div><div><kbd>X</kbd>режим огня</div><div><kbd>V</kbd>сменить прицел</div>
       <div><kbd>N</kbd>откинуть увеличитель</div><div><kbd>Колесо</kbd>кратность / зум</div>
-      <div><kbd>C</kbd>фонарь</div><div><kbd>Z</kbd>ЛЦУ</div><div><kbd>B</kbd>сошки</div><div><kbd>K</kbd>приклад</div>
+      <div><kbd>C</kbd>фонарь</div><div><kbd>Z</kbd>ЛЦУ</div><div><kbd>U</kbd>заменить батареи</div><div><kbd>L</kbd>день / сумерки / ночь</div><div><kbd>B</kbd>сошки</div><div><kbd>K</kbd>приклад</div>
       <div><kbd>T</kbd>${esc(d.chargeLabel || "затвор")}</div>${d.feed === "tube" ? "" : "<div><kbd>M</kbd>магазин</div>"}<div><kbd>H</kbd>эта подсказка</div>
       <div class="h-n">Клик по детали — открыть её слот. Перетаскивание — вращение, колесо — масштаб.</div>`);
     this.helpBtn = el("button", "btn help-btn", "?");
@@ -101,6 +101,8 @@ var UI = class {
       laser: b("laser", "ЛЦУ", a.toggleLaser),
       bipod: b("bipod", "Сошки", a.toggleBipod),
       fold: b("fold", "Приклад", a.toggleFold),
+      batt: b("batt", "Батареи", a.replaceBatteries),
+      time: b("time", "День", a.cycleTime),
       sound: b("sound", "Звук", a.toggleSound, "icon")
     };
   }
@@ -239,6 +241,8 @@ var UI = class {
       st.magAside,
       st.light,
       st.laser,
+      a.time,
+      a.battInfo().map((b) => b.pct + (b.on ? "*" : "")).join(","),
       st.bipod,
       st.folded,
       a.audio.muted,
@@ -255,8 +259,12 @@ var UI = class {
     this.ammo.className = "panel ammo" + (low ? " low" : "");
     this.ammo.innerHTML = `<div class="a-n">${st.magIn ? n : "—"}${st.chambered ? "<sup>+1</sup>" : ""}<small>/${st.cap}</small></div>
       <div class="a-m"><b>${MODE[st.mode]}</b><span>${st.busy ? a.def.feed === "tube" ? "заряжание…" : "перезарядка…" : !st.magIn ? "нет магазина" : st.spent ? "передёрнуть цевьё" : !st.chambered ? "патронник пуст" : st.holdOpen ? a.def.id === "glock18c" ? "кожух на задержке" : "затвор на задержке" : st.handleLocked ? "рукоять в вырезе" : "готов"}</span></div>`;
+    const bi = a.battInfo();
+    if (bi.length) this.ammo.innerHTML += `<div class="a-batt">${bi.map((b) => `<div class="bt${b.on ? " on" : ""}${b.pct <= 15 ? " low" : ""}" title="${b.min} мин на полной мощности"><span>${b.label}</span><i><em style="width:${b.pct}%"></em></i><b>${b.pct}%</b></div>`).join("")}</div>`;
     const B = this.btn;
     B.mode.textContent = MODE[st.mode];
+    B.time.textContent = a.timeLabel();
+    B.batt.hidden = !bi.length || bi.every((b) => b.pct >= 100);
     B.ads.classList.toggle("on", st.ads);
     const multi = a.sights.length > 1;
     B.sight.hidden = !multi;

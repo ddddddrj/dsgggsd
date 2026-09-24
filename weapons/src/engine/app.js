@@ -71,6 +71,7 @@ async function boot(def, lib) {
     zoom: 1,
     light: false,
     laser: false,
+    batt: {},
     folded: false,
     bipod: false,
     magAside: false,
@@ -113,9 +114,9 @@ async function boot(def, lib) {
     poseSelector(true);
     const mz = asm.info("muzzle")?.muzzle;
     audio.muzzle = mz ? mz.kind : "bare";
+    if (audio.ctx) (window.requestIdleCallback || setTimeout)(() => audio.shotBuffer(audio.shotFamily(), audio.muzzle));
     st.stats = asm.stats();
-    for (const it of asm.installed.values()) {
-      const s = it.info?.sight;
+    for (const it of asm.installed.values()) for (const s of [it.info?.sight, ...it.info?.alt || []]) {
       if (!s || !s.lens || s.lens.userData.stencilSet) continue;
       const ref = stencilRef++;
       const m = s.lens.material;
@@ -144,8 +145,8 @@ async function boot(def, lib) {
     lasers = asm.withInfo("laser");
     if (!lights.length) st.light = false;
     if (!lasers.length) st.laser = false;
-    for (const l of lights) l.data.lens.material.emissiveIntensity = st.light ? 6 : 0;
-    for (const l of lasers) l.data.lens.material.emissiveIntensity = st.laser ? 5 : 0;
+    for (const it of [...lights, ...lasers]) if (st.batt[battKey(it)] == null) st.batt[battKey(it)] = 1;
+    lensGlow();
     const mi = asm.info("mag")?.mag;
     if (mi?.rounds) mi.rounds.visible = st.mag > 0;
     const magObj = asm.installed.get("mag")?.obj;
@@ -169,8 +170,12 @@ async function boot(def, lib) {
       const up = new THREE8.Vector3(0, 1, 0).transformDirection(m);
       sights.push({ id, label, eye, dir, up, mag: s.mag || 1, zoom: s.zoom, reticle: s.reticle, eyeRelief: s.eyeRelief, magnifier: s.magnifier, x0: eye.x });
     };
+    // дополнительные прицельные оси модуля (коллиматор поверх призмы/оптики): V переключает на них
+    const pushAlt = (it) => (it.info?.alt || []).forEach((a, i) => push(it.slot.id + ":alt" + i, it.part.name + " — " + (a.label || "коллиматор"), it.obj, a));
     const opt = asm.installed.get("optic");
     if (opt?.info?.sight) push("optic", opt.part.name, opt.obj, opt.info.sight);
+    if (opt) pushAlt(opt);
+    for (const it of asm.installed.values()) if (it !== opt) pushAlt(it);
     for (const it of asm.installed.values()) if (it.slot.id !== "optic" && it.info?.sight && !it.info.sight.magnifier) push(it.slot.id, it.part.name, it.obj, it.info.sight);
     const mg = asm.installed.get("magnifier");
     if (mg?.info?.sight && sights[0]) {
@@ -195,7 +200,9 @@ async function boot(def, lib) {
     if (rear && front && !opticFolds) {
       const dir = front.clone().sub(rear).normalize();
       const type = rearIt ? rearIt.info.irons.type || "aperture" : base.irons?.type || "notch";
-      sights.push({ id: "irons", label: "Механический прицел", eye: rear, dir, mag: 1, irons: true, type, rearObj: rearIt?.obj || null, x0: rear.x });
+      const eyeDist = rearIt ? rearIt.info.irons.eye : base.irons?.eye;
+      const apertureR = rearIt ? rearIt.info.irons.hole : base.irons?.hole;
+      sights.push({ id: "irons", label: "Механический прицел", eye: rear, dir, mag: 1, irons: true, type, eyeDist, apertureR, rearObj: rearIt?.obj || base.nodes?.rearSight || null, x0: rear.x });
     }
     const optNow = sights.find((s) => s.id === "optic")?.label || null;
     const i = sights.findIndex((s) => s.id === prev);
@@ -226,7 +233,7 @@ async function boot(def, lib) {
     if (!s) return null;
     let ex = base.eyeX ?? -240;
     if (s.eyeRelief) ex = s.eye.x - s.eyeRelief;
-    else if (s.irons) ex = s.type === "aperture" ? s.eye.x - 75 : Math.min(ex, s.eye.x - 220);
+    else if (s.irons) ex = s.type === "aperture" ? s.eye.x - (s.eyeDist ?? 75) : Math.min(ex, s.eye.x - 220);
     else if (!s.irons) ex = Math.min(ex, s.eye.x - 60);
     const t = (ex - s.eye.x) / (s.dir.x || 1);
     const eyeGun = s.eye.clone().addScaledVector(s.dir, t);
@@ -654,14 +661,129 @@ async function boot(def, lib) {
     else if (!st.magAside && mi >= 0) st.sightIdx = mi;
     ui?.hud();
   }
+  /* ---------------------------------------------------------- батареи */
+  // Каждый модуль с фонарём/ЛЦУ — своя батарея (у комбо-блоков общая на оба излучателя).
+  // Время работы на полной мощности — 20…30 мин; стабилизированный драйвер держит яркость
+  // до ≈15 % заряда, дальше свет садится, под конец мерцает и гаснет.
+  const BATT_LS = "gunsmith:batt:" + def.id;
+  try {
+    Object.assign(st.batt, JSON.parse(localStorage.getItem(BATT_LS) || "{}"));
+  } catch (e) {
+  }
+  function battKey(it) {
+    return it.slotId + ":" + (it.part?.id || "base");
+  }
+  function lightSpec(it) {
+    const d = it.data, lm = d.lumens || 500;
+    const cd = d.cd ?? lm * 22;
+    return {
+      key: it.slotId + ":" + (it.part?.id || ""),
+      lm,
+      cd,
+      hot: d.hot ?? (cd / lm > 28 ? 0.15 : 0.21),
+      spill: d.spill ?? 0.085,
+      angle: d.angle ?? 0.62,
+      kelvin: d.kelvin ?? 6200,
+      throw: Math.min(130, 2 * Math.sqrt(cd) * 0.45),
+      lensR: (d.lensR ?? 11) / 1e3,
+      batt: d.batt ?? (lm >= 1000 ? 21 : lm >= 600 ? 24 : 28)
+    };
+  }
+  function laserBatt(it) {
+    return it.data.batt ?? (it.info?.light ? 26 : 30);
+  }
+  function battLevel(c) {
+    if (c <= 0) return 0;
+    let v = c > 0.15 ? 1 : 0.2 + 0.8 * Math.pow(c / 0.15, 1.6);
+    if (c < 0.04) v *= Math.random() < 0.12 ? 0.15 : 0.75 + Math.random() * 0.25;
+    return v;
+  }
+  function lensGlow() {
+    for (const l of lights) l.data.lens.material.emissiveIntensity = st.light ? 6 * battLevel(st.batt[battKey(l)] ?? 1) : 0;
+    for (const l of lasers) l.data.lens.material.emissiveIntensity = st.laser ? 5 * battLevel(st.batt[battKey(l)] ?? 1) : 0;
+  }
+  let battSaveT = 0, battHudT = 0;
+  function drainBatteries(dt) {
+    if (!st.light && !st.laser) return;
+    const used = new Map();
+    if (st.light) for (const l of lights) used.set(battKey(l), (used.get(battKey(l)) || 0) + 1 / (lightSpec(l).batt * 60));
+    if (st.laser) for (const l of lasers) used.set(battKey(l), (used.get(battKey(l)) || 0) + 1 / (laserBatt(l) * 60));
+    let dead = false;
+    for (const [k, rate] of used) {
+      const before = st.batt[k] ?? 1;
+      st.batt[k] = Math.max(0, before - rate * dt);
+      if (before > 0 && st.batt[k] === 0) dead = true;
+    }
+    if (dead) {
+      if (st.light && lights.every((l) => !(st.batt[battKey(l)] > 0))) {
+        st.light = false;
+        ui?.toast("Батарея фонаря села — U: заменить");
+      }
+      if (st.laser && lasers.every((l) => !(st.batt[battKey(l)] > 0))) {
+        st.laser = false;
+        ui?.toast("Батарея ЛЦУ села — U: заменить");
+      }
+      audio.click();
+    }
+    lensGlow();
+    battSaveT += dt;
+    battHudT += dt;
+    if (battSaveT > 5) {
+      battSaveT = 0;
+      try {
+        localStorage.setItem(BATT_LS, JSON.stringify(st.batt));
+      } catch (e) {
+      }
+    }
+    if (battHudT > 1 || dead) {
+      battHudT = 0;
+      ui?.hud();
+    }
+  }
+  function battInfo() {
+    const out = [];
+    const seen = new Set();
+    for (const [kind, list] of [["light", lights], ["laser", lasers]]) for (const l of list) {
+      const k = battKey(l);
+      const combo = seen.has(k);
+      seen.add(k);
+      if (combo) continue;
+      const c = st.batt[k] ?? 1;
+      const both = lights.some((x) => battKey(x) === k) && lasers.some((x) => battKey(x) === k);
+      const min = kind === "light" ? lightSpec(l).batt : laserBatt(l);
+      out.push({ label: both ? "Фонарь+ЛЦУ" : kind === "light" ? "Фонарь" : "ЛЦУ", pct: Math.round(c * 100), min: Math.round(c * min), on: kind === "light" ? st.light || (both && st.laser) : st.laser || (both && st.light) });
+    }
+    return out;
+  }
+  function replaceBatteries() {
+    const all = [...lights, ...lasers];
+    if (!all.length) {
+      ui?.toast("Нет модулей с батареями");
+      return;
+    }
+    for (const l of all) st.batt[battKey(l)] = 1;
+    audio.batteryChange?.() ?? audio.click();
+    try {
+      localStorage.setItem(BATT_LS, JSON.stringify(st.batt));
+    } catch (e) {
+    }
+    lensGlow();
+    ui?.toast("Батареи заменены: CR123A, 100 %");
+    ui?.hud();
+  }
   function toggleLight() {
     if (!lights.length) {
       ui?.toast("Фонарь не установлен");
       return;
     }
+    if (!st.light && lights.every((l) => !(st.batt[battKey(l)] > 0))) {
+      audio.click();
+      ui?.toast("Батарея фонаря разряжена — U: заменить");
+      return;
+    }
     st.light = !st.light;
-    audio.click();
-    for (const l of lights) l.data.lens.material.emissiveIntensity = st.light ? 6 : 0;
+    audio.tailcap?.(st.light) ?? audio.click();
+    lensGlow();
     ui?.hud();
   }
   function toggleLaser() {
@@ -669,10 +791,33 @@ async function boot(def, lib) {
       ui?.toast("ЛЦУ не установлен");
       return;
     }
+    if (!st.laser && lasers.every((l) => !(st.batt[battKey(l)] > 0))) {
+      audio.click();
+      ui?.toast("Батарея ЛЦУ разряжена — U: заменить");
+      return;
+    }
     st.laser = !st.laser;
     audio.click();
-    for (const l of lasers) l.data.lens.material.emissiveIntensity = st.laser ? 5 : 0;
+    lensGlow();
     ui?.hud();
+  }
+  /* ---------------------------------------------------------- время суток */
+  const TIME_ORDER = ["day", "dusk", "night"], TIME_LABEL = { day: "День", dusk: "Сумерки", night: "Ночь" };
+  function setTime(m) {
+    S.setTime(m);
+    fx.timeOfDay = m;
+    try {
+      localStorage.setItem("gunsmith:time", m);
+    } catch (e) {
+    }
+    app?.invalidate?.();
+    ui?.hud();
+  }
+  function cycleTime() {
+    const m = TIME_ORDER[(TIME_ORDER.indexOf(S.time) + 1) % TIME_ORDER.length];
+    setTime(m);
+    audio.click();
+    ui?.toast("Время суток: " + TIME_LABEL[m] + (m === "night" && !lights.length ? " — поставьте фонарь" : ""));
   }
   function toggleBipod() {
     const b = asm.withInfo("bipod")[0];
@@ -858,6 +1003,8 @@ async function boot(def, lib) {
     KeyN: () => toggleMagnifier(),
     KeyC: toggleLight,
     KeyZ: toggleLaser,
+    KeyL: cycleTime,
+    KeyU: replaceBatteries,
     KeyB: toggleBipod,
     KeyK: toggleFold,
     KeyT: () => {
@@ -968,8 +1115,31 @@ async function boot(def, lib) {
         m.material.transparent = true;
         m.material.depthWrite = false;
       }
-      m.material.opacity = 1 - 0.55 * k;
+      // глаз сфокусирован на мушке: близкий диоптр размыт и «просвечивает»
+      m.material.opacity = 1 - 0.62 * k;
     });
+  }
+  // Диоптр вблизи глаза: глаз держит в фокусе мушку, барабан вокруг отверстия размыт.
+  // Размытие — backdrop-filter по маске-кольцу, радиус отверстия считается из геометрии.
+  const ghost = document.createElement("div");
+  ghost.style.cssText = "position:fixed;inset:0;pointer-events:none;z-index:5;opacity:0;transition:none";
+  document.body.appendChild(ghost);
+  let ghostKey = "";
+  function ghostRing(p, k) {
+    if (!p || k < 0.02) {
+      if (ghostKey) ghost.style.opacity = "0", ghostKey = "";
+      return;
+    }
+    const rh = p.s.apertureR ?? 1.8, d = (p.s.eyeDist ?? 75) + 0.5;
+    const px = Math.atan(rh / d) / Math.tan(S.camera.fov * D2R2 / 2) * innerHeight / 2;
+    const key = Math.round(px) + "|" + k.toFixed(2);
+    if (key === ghostKey) return;
+    ghostKey = key;
+    const r0 = px * 0.92, r1 = px * 1.35;
+    const m = `radial-gradient(circle at 50% 50%, transparent ${r0}px, #000 ${r1}px)`;
+    ghost.style.backdropFilter = ghost.style.webkitBackdropFilter = `blur(${(9 * k).toFixed(1)}px) brightness(${(1 - 0.25 * k).toFixed(2)})`;
+    ghost.style.maskImage = ghost.style.webkitMaskImage = m;
+    ghost.style.opacity = String(Math.min(1, k * 1.2));
   }
   function update(dt) {
     tw.update(dt);
@@ -1035,7 +1205,7 @@ async function boot(def, lib) {
         const nv = !!p.s.nv && !st.magAside && st.adsT > 0.85;
         ui?.nv(nv);
         for (const q of sights) if (q.hide) q.hide.visible = !(nv && q === p.s);
-        defocus(p.s.irons && p.s.type === "aperture" ? p.s.rearObj : null, e);
+        ghostRing(p.s.irons && p.s.type === "aperture" ? p : null, e);
       }
       if (!st.ads && st.adsT === 0) {
         controls.enabled = true;
@@ -1052,6 +1222,7 @@ async function boot(def, lib) {
       ui?.nv(false);
       for (const q of sights) if (q.hide) q.hide.visible = true;
       if (defocused) restoreFocus();
+      ghostRing(null, 0);
       controls.enabled = true;
       controls.target.lerp(focusTarget, 1 - Math.pow(0.02, dt));
       if (focusDist) {
@@ -1063,17 +1234,19 @@ async function boot(def, lib) {
       controls.update();
     }
     gun.updateMatrixWorld(true);
+    drainBatteries(dt);
     if (lights.length && st.light) {
-      const L = lights[0];
+      const L = lights.find((l) => st.batt[battKey(l)] > 0) || lights[0];
       const p = L.obj.localToWorld(new THREE8.Vector3(...L.data.p));
       const dv = new THREE8.Vector3(1, 0, 0).transformDirection(L.obj.matrixWorld);
-      fx.setLight(true, p, dv, L.data.lumens);
+      fx.setLight(true, p, dv, lightSpec(L), battLevel(st.batt[battKey(L)] ?? 1), S.beamK ?? 0.06, S.camera);
     } else fx.setLight(false);
     if (lasers.length && st.laser) {
-      const L = lasers[0];
+      const L = lasers.find((l) => st.batt[battKey(l)] > 0) || lasers[0];
       const p = L.obj.localToWorld(new THREE8.Vector3(...L.data.p));
       const dv = new THREE8.Vector3(1, 0, 0).transformDirection(L.obj.matrixWorld);
-      fx.setLaser(true, p, dv, S.range.hitables);
+      fx.setLaserLevel(battLevel(st.batt[battKey(L)] ?? 1), S.beamK ?? 0.06);
+      fx.setLaser(true, p, dv, S.range.hitables, L.data.color ?? 16722458);
     } else fx.setLaser(false);
     fx.update(dt, (s, n) => audio.casing(0, s.kind, n > 1 ? 0.35 : 0.8), S.camera, fx.heat > 0.3 ? muzzleWorld(mzTmp) : null);
     S.range.update(dt);
@@ -1110,6 +1283,14 @@ async function boot(def, lib) {
     toggleMagnifier,
     toggleLight,
     toggleLaser,
+    replaceBatteries,
+    battInfo,
+    cycleTime,
+    setTime,
+    get time() {
+      return S.time;
+    },
+    timeLabel: () => TIME_LABEL[S.time],
     toggleBipod,
     toggleFold,
     toggleMag,
@@ -1134,6 +1315,14 @@ async function boot(def, lib) {
     } catch (e) {
       console.error("cfg", e);
     }
+  }
+  {
+    let tm = qs.get("time");
+    try {
+      tm = tm || localStorage.getItem("gunsmith:time");
+    } catch (e) {
+    }
+    S.setTime(TIME_ORDER.includes(tm) ? tm : "day");
   }
   applyConfig(def.defaults, { init: true });
   app.defaultStats = { ...st.stats };

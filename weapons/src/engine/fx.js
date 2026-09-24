@@ -249,6 +249,172 @@ var Particles = class {
     }
   }
 };
+// Цветовая температура светодиода → линейный RGB (приближение Таннера Хелланда).
+function kelvinColor(k) {
+  const t = k / 100;
+  let r, g, b;
+  if (t <= 66) {
+    r = 255;
+    g = 99.47 * Math.log(t) - 161.12;
+    b = t <= 19 ? 0 : 138.52 * Math.log(t - 10) - 305.04;
+  } else {
+    r = 329.7 * Math.pow(t - 60, -0.1332);
+    g = 288.12 * Math.pow(t - 60, -0.0755);
+    b = 255;
+  }
+  const c = (v) => Math.min(255, Math.max(0, v)) / 255;
+  return new THREE6.Color().setRGB(c(r), c(g), c(b), THREE6.SRGBColorSpace);
+}
+// Световое пятно отражателя: горячее ядро, тёмное «кольцо» перехода, широкая засветка и
+// слабое внешнее гало от кромки отражателя. Небольшая неровность — след апельсиновой корки.
+function torchCookie(hot, spill) {
+  const S2 = 256, c = document.createElement("canvas");
+  c.width = c.height = S2;
+  const g = c.getContext("2d"), img = g.createImageData(S2, S2);
+  for (let y = 0; y < S2; y++) for (let x = 0; x < S2; x++) {
+    const dx = (x + 0.5) / S2 * 2 - 1, dy = (y + 0.5) / S2 * 2 - 1, r = Math.hypot(dx, dy);
+    const a = Math.atan2(dy, dx);
+    const core = Math.exp(-Math.pow(r / hot, 2.2));
+    const ring = 0.06 * Math.exp(-Math.pow((r - hot * 1.9) / (hot * 0.45), 2));
+    const sp = spill * Math.pow(Math.max(0, 1 - r), 1.4) * (1 - 0.35 * Math.exp(-Math.pow((r - hot * 1.35) / (hot * 0.3), 2)));
+    const halo = 0.005 * Math.exp(-Math.pow((r - 0.86) / 0.08, 2));
+    const orange = 1 + 0.035 * Math.sin(a * 23 + r * 40) * Math.sin(a * 7 - r * 25);
+    const v = Math.min(1, (core + ring + sp + halo) * orange) * (r < 1 ? 1 : 0);
+    const q = Math.pow(v, 1 / 2.2) * 255;
+    const i = (y * S2 + x) * 4;
+    img.data[i] = img.data[i + 1] = img.data[i + 2] = q;
+    img.data[i + 3] = 255;
+  }
+  g.putImageData(img, 0, 0);
+  const t = new THREE6.CanvasTexture(c);
+  t.colorSpace = THREE6.SRGBColorSpace;
+  return t;
+}
+var BEAM_VS = `
+varying vec3 vW;
+void main(){
+  vec4 w = modelMatrix * vec4(position, 1.);
+  vW = w.xyz;
+  gl_Position = projectionMatrix * viewMatrix * w;
+}`;
+// Объёмный луч: по лучу зрения от камеры до задней грани конуса — 28 шагов; в каждой точке
+// рассеяние ∝ I(θ)/t² (профиль пятна как у куки-текстуры). Земля перекрывает луч.
+// Пыль/влага — медленный шум в мировых координатах, чтобы луч «жил».
+var BEAM_FS = `
+uniform vec3 color; uniform float k; uniform float len; uniform float tanA; uniform float hot; uniform float spill;
+uniform float time; uniform vec3 camPos; uniform vec3 O; uniform vec3 D;
+varying vec3 vW;
+float h(vec3 p){ return fract(sin(dot(p, vec3(12.9898,78.233,45.164))) * 43758.5453); }
+float n3(vec3 p){ vec3 i = floor(p), f = fract(p); f = f*f*(3.-2.*f);
+  return mix(mix(mix(h(i), h(i+vec3(1,0,0)), f.x), mix(h(i+vec3(0,1,0)), h(i+vec3(1,1,0)), f.x), f.y),
+             mix(mix(h(i+vec3(0,0,1)), h(i+vec3(1,0,1)), f.x), mix(h(i+vec3(0,1,1)), h(i+vec3(1,1,1)), f.x), f.y), f.z); }
+float groundAt(vec3 p){ return (abs(p.x + .8) < 3. && abs(p.z) < 2.5) ? .12 : 0.; }
+void main(){
+  vec3 rd = vW - camPos; float L = length(rd); rd /= L;
+  float t0 = dot(camPos - O, D), dd = dot(rd, D);
+  float s0 = 0., s1 = L;
+  if (abs(dd) > 1e-4) {
+    float a = (0.02 - t0) / dd, b = (len - t0) / dd;
+    s0 = max(s0, min(a, b)); s1 = min(s1, max(a, b));
+  }
+  if (s1 <= s0) discard;
+  const int N = 28;
+  float ds = (s1 - s0) / float(N);
+  float j = h(vec3(gl_FragCoord.xy, time));
+  float acc = 0.;
+  for (int i = 0; i < N; i++) {
+    vec3 p = camPos + rd * (s0 + (float(i) + j) * ds);
+    if (p.y < groundAt(p)) break;
+    vec3 v = p - O; float t = dot(v, D);
+    if (t <= 0.) continue;
+    float r = length(v - D * t) / (t * tanA);
+    if (r >= 1.) continue;
+    float prof = exp(-pow(r / hot, 2.2)) + spill * pow(1. - r, 1.4);
+    float tt = max(t, .25);
+    float dust = .6 + .55 * n3(p * 1.7 + vec3(time * .05, time * .015, time * .03)) + .3 * n3(p * 7.3 - time * .08);
+    acc += prof / (tt * tt) * dust * ds;
+  }
+  float nearCam = smoothstep(.02, .35, distance(vW, camPos));
+  float a = k * acc;
+  a = a / (1. + a * .6);
+  gl_FragColor = vec4(color * a * nearCam, 1.);
+}`;
+var Torch = class {
+  constructor(scene, T2) {
+    this.spot = new THREE6.SpotLight(16777215, 0, 140, 0.62, 0, 2);
+    this.spot.castShadow = true;
+    this.spot.shadow.mapSize.set(1024, 1024);
+    this.spot.shadow.camera.near = 0.03;
+    this.spot.shadow.camera.far = 140;
+    this.spot.shadow.bias = -2e-4;
+    this.spot.shadow.normalBias = 0.02;
+    this.spot.visible = false;
+    scene.add(this.spot, this.spot.target);
+    this.cookies = new Map();
+    const geo = new THREE6.ConeGeometry(1, 1, 48, 1, true);
+    geo.translate(0, -0.5, 0);
+    geo.rotateZ(Math.PI / 2);
+    this.beamU = { color: { value: new THREE6.Color() }, k: { value: 0 }, len: { value: 40 }, tanA: { value: 0.3 }, hot: { value: 0.3 }, spill: { value: 0.1 }, time: { value: 0 }, camPos: { value: new THREE6.Vector3() }, O: { value: new THREE6.Vector3() }, D: { value: new THREE6.Vector3(1, 0, 0) } };
+    this.beam = new THREE6.Mesh(geo, new THREE6.ShaderMaterial({ uniforms: this.beamU, vertexShader: BEAM_VS, fragmentShader: BEAM_FS, transparent: true, depthWrite: false, blending: THREE6.AdditiveBlending, side: THREE6.BackSide, toneMapped: false, fog: false }));
+    this.beam.frustumCulled = false;
+    this.beam.visible = false;
+    this.beam.renderOrder = 5;
+    scene.add(this.beam);
+    this.glare = new THREE6.Sprite(additive(T2.glow, 16777215, 0));
+    this.glare.visible = false;
+    this.glare.renderOrder = 6;
+    scene.add(this.glare);
+    this.t = 0;
+    this._v = new THREE6.Vector3();
+  }
+  cookie(spec) {
+    const key = spec.hot.toFixed(3) + "|" + spec.spill.toFixed(3);
+    if (!this.cookies.has(key)) this.cookies.set(key, torchCookie(spec.hot, spec.spill));
+    return this.cookies.get(key);
+  }
+  set(on, pos, dir, spec, level, haze, cam) {
+    this.spot.visible = this.beam.visible = this.glare.visible = !!on;
+    if (!on) {
+      this.spot.intensity = 0;
+      return;
+    }
+    const sp = this.spot, a = spec.angle ?? 0.62;
+    if (sp.userData.key !== spec.key) {
+      sp.userData.key = spec.key;
+      sp.map = this.cookie(spec);
+      sp.angle = a;
+      sp.color.copy(kelvinColor(spec.kelvin));
+      this.beamU.color.value.copy(sp.color);
+      this.beamU.tanA.value = Math.tan(a);
+      this.beamU.hot.value = spec.hot;
+      this.beamU.spill.value = spec.spill;
+      this.beamU.len.value = spec.throw;
+      this.beam.scale.set(spec.throw, Math.tan(a) * spec.throw, Math.tan(a) * spec.throw);
+    }
+    // сила света в канделах → единицы сцены (солнце днём ≈2.4)
+    sp.intensity = spec.cd * 0.022 * level;
+    sp.position.copy(pos);
+    sp.target.position.copy(pos).addScaledVector(dir, 10);
+    this.beam.position.copy(pos);
+    this.beam.quaternion.setFromUnitVectors(X_AXIS, dir);
+    this.t += 0.016;
+    this.beamU.time.value = this.t;
+    this.beamU.O.value.copy(pos);
+    this.beamU.D.value.copy(dir);
+    this.beamU.k.value = 1.1e-3 * spec.cd * 0.022 * haze * level;
+    if (cam) this.beamU.camPos.value.copy(cam.position);
+    // блик линзы: виден, когда смотришь в фонарь
+    this.glare.position.copy(pos).addScaledVector(dir, 2e-3);
+    let facing = 0;
+    if (cam) {
+      this._v.copy(cam.position).sub(pos).normalize();
+      facing = Math.max(0, this._v.dot(dir));
+    }
+    const g = Math.pow(facing, 6) * level;
+    this.glare.material.opacity = Math.min(1, 0.25 * level + g * 1.2);
+    this.glare.scale.setScalar(spec.lensR * 2.4 + g * 0.35 * Math.sqrt(spec.cd / 2e4));
+  }
+};
 var MAX_SHELLS = 60;
 var X_AXIS = new THREE6.Vector3(1, 0, 0);
 var FX = class {
@@ -288,11 +454,7 @@ var FX = class {
     this.dot = new THREE6.Sprite(additive(T2.glow, 16724e3, 1));
     this.dot.visible = false;
     scene.add(this.beam, this.dot);
-    this.spot = new THREE6.SpotLight(16773596, 0, 60, 0.28, 0.55, 1.4);
-    scene.add(this.spot, this.spot.target);
-    this.lampGlow = new THREE6.Sprite(additive(T2.glow, 16774886, 0));
-    this.lampGlow.scale.setScalar(0.07);
-    scene.add(this.lampGlow);
+    this.torch = new Torch(scene, T2);
     this.ray = new THREE6.Raycaster();
     this._v = new THREE6.Vector3();
     this._q = new THREE6.Quaternion();
@@ -475,9 +637,14 @@ var FX = class {
       }
     }
   }
-  setLaser(on, pos, dir, hitables) {
+  setLaser(on, pos, dir, hitables, color = 16722458) {
     this.beam.visible = this.dot.visible = on;
     if (!on) return;
+    if (this.laserColor !== color) {
+      this.laserColor = color;
+      this.beam.material.color.setHex(color);
+      this.dot.material.color.setHex(color);
+    }
     this.ray.set(pos, dir);
     this.ray.far = 250;
     const h = this.ray.intersectObjects(hitables, false)[0];
@@ -486,15 +653,17 @@ var FX = class {
     this.beam.scale.set(d, 1, 1);
     this.beam.quaternion.setFromUnitVectors(X_AXIS, dir);
     this.dot.position.copy(pos).addScaledVector(dir, d - 0.01);
-    this.dot.scale.setScalar(0.015 + d * 22e-4);
+    this.dot.scale.setScalar((0.015 + d * 22e-4) * (this.dotK || 1));
   }
-  setLight(on, pos, dir, lumens = 1e3) {
-    this.spot.intensity = on ? 30 * (lumens / 1e3) : 0;
-    this.lampGlow.material.opacity = on ? 0.9 : 0;
-    if (!on) return;
-    this.spot.position.copy(pos);
-    this.spot.target.position.copy(pos).addScaledVector(dir, 10);
-    this.lampGlow.position.copy(pos).addScaledVector(dir, 4e-3);
+  // spec: {cd, spill, hot, kelvin, lens}; level — отдача с учётом батареи (0…1); haze — видимость луча
+  setLight(on, pos, dir, spec, level = 1, haze = 1, cam) {
+    this.torch.set(on && level > 0, pos, dir, spec, level, haze, cam);
+  }
+  setLaserLevel(level, haze) {
+    const k = Math.max(0, level);
+    this.beam.material.opacity = (0.05 + 0.3 * haze) * k;
+    this.dot.material.opacity = Math.min(1, 0.25 + k);
+    this.dotK = 0.6 + 0.8 * haze;
   }
   // muzzle — текущий дульный срез: от нагретого ствола после очереди идёт струйка дыма
   update(dt, onShellBounce, cam, muzzle) {

@@ -90,7 +90,96 @@ function createScene(canvasHost) {
     camera.updateProjectionMatrix();
     renderer.setSize(innerWidth, innerHeight);
   });
-  return { renderer, scene, camera, sun, range, env };
+  const S = { renderer, scene, camera, sun, range, env, hemi, rim, fill, sky };
+  S.night = buildNight(scene);
+  S.time = "day";
+  S.setTime = (m) => setTime(S, m);
+  return S;
+}
+// Время суток. Значения подобраны под ACES: днём солнце ≈4:1 к небу; ночью — только луна
+// (холодная, очень слабая), звёзды, дежурный натриевый фонарь у рубежа и свет оружейных фонарей.
+var TIMES = {
+  day: { sun: [16773340, 2.4], sunPos: [-2.2, 5.5, 3.2], hemi: [13623551, 6971466, 0.55], rim: 1.1, fill: 0.5, envI: 0.75, exp: 1, sky: [6125200, 12174281, 9210492], fog: [11845058, 60, 420], stars: 0, lamp: 0, beam: 0.06 },
+  dusk: { sun: [16750950, 0.85], sunPos: [-5.5, 0.9, 1.6], hemi: [7372964, 2890785, 0.22], rim: 0.35, fill: 0.12, envI: 0.26, exp: 1.12, sky: [2699098, 13273173, 3549226], fog: [7031908, 40, 320], stars: 0.25, lamp: 0.7, beam: 0.45 },
+  night: { sun: [9481471, 0.13], sunPos: [2.5, 4.5, -2.2], hemi: [1714746, 526344, 0.05], rim: 0, fill: 0, envI: 0.018, exp: 1.35, sky: [199442, 1122876, 263429], fog: [264981, 18, 190], stars: 1, lamp: 1, beam: 1 }
+};
+function setTime(S, m) {
+  const t = TIMES[m] || TIMES.day;
+  S.time = TIMES[m] ? m : "day";
+  S.sun.color.setHex(t.sun[0]);
+  S.sun.intensity = t.sun[1];
+  S.sun.position.set(...t.sunPos);
+  S.hemi.color.setHex(t.hemi[0]);
+  S.hemi.groundColor.setHex(t.hemi[1]);
+  S.hemi.intensity = t.hemi[2];
+  S.rim.intensity = t.rim;
+  S.fill.intensity = t.fill;
+  S.scene.environmentIntensity = t.envI;
+  S.renderer.toneMappingExposure = t.exp;
+  const u = S.sky.material.uniforms;
+  u.top.value.setHex(t.sky[0]);
+  u.mid.value.setHex(t.sky[1]);
+  u.bot.value.setHex(t.sky[2]);
+  S.scene.fog.color.setHex(t.fog[0]);
+  S.scene.fog.near = t.fog[1];
+  S.scene.fog.far = t.fog[2];
+  const N = S.night;
+  N.stars.material.opacity = t.stars;
+  N.stars.visible = N.moon.visible = t.stars > 0;
+  N.moon.material.opacity = m === "night" ? 1 : 0.35;
+  N.lamp.intensity = 34 * t.lamp;
+  N.lampBulb.material.emissiveIntensity = 4 * t.lamp;
+  S.beamK = t.beam;
+}
+function buildNight(scene) {
+  const n = 1800, pos = new Float32Array(n * 3), col = new Float32Array(n * 3);
+  for (let i = 0; i < n; i++) {
+    const u = Math.random(), v = Math.random() * 0.96 + 0.04;
+    const th = u * Math.PI * 2, y = Math.pow(v, 0.8), r = Math.sqrt(1 - y * y);
+    pos.set([Math.cos(th) * r * 850, y * 850, Math.sin(th) * r * 850], i * 3);
+    const b = 0.25 + Math.pow(Math.random(), 6) * 1.6, w = Math.random();
+    col.set([b * (0.85 + w * 0.15), b * 0.92, b * (1.05 - w * 0.2)], i * 3);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+  g.setAttribute("color", new THREE.BufferAttribute(col, 3));
+  const stars = new THREE.Points(g, new THREE.PointsMaterial({ size: 1.6, sizeAttenuation: false, vertexColors: true, transparent: true, opacity: 0, depthWrite: false, fog: false, toneMapped: false }));
+  stars.visible = false;
+  scene.add(stars);
+  const mt = canvasTex(128, 128, (c, w) => {
+    const gr = c.createRadialGradient(w / 2, w / 2, w * 0.12, w / 2, w / 2, w / 2);
+    gr.addColorStop(0, "rgba(235,240,255,1)");
+    gr.addColorStop(0.2, "rgba(210,222,255,.95)");
+    gr.addColorStop(0.24, "rgba(170,190,240,.25)");
+    gr.addColorStop(1, "rgba(120,140,220,0)");
+    c.fillStyle = gr;
+    c.fillRect(0, 0, w, w);
+    for (let i = 0; i < 9; i++) {
+      c.fillStyle = `rgba(150,160,185,${0.25 + Math.random() * 0.2})`;
+      c.beginPath();
+      c.arc(w / 2 + (Math.random() - 0.5) * 18, w / 2 + (Math.random() - 0.5) * 18, 2 + Math.random() * 4, 0, 7);
+      c.fill();
+    }
+  });
+  const moon = new THREE.Sprite(new THREE.SpriteMaterial({ map: mt, transparent: true, depthWrite: false, fog: false, toneMapped: false }));
+  moon.position.set(2.5, 4.5, -2.2).normalize().multiplyScalar(820);
+  moon.scale.setScalar(110);
+  moon.visible = false;
+  scene.add(moon);
+  // дежурный фонарь над рубежом: натрий, тёплый, слабый — оружие ночью видно, мишени нет
+  const lamp = new THREE.PointLight(16751939, 0, 14, 2);
+  lamp.position.set(-1.6, 3.3, 2.2);
+  scene.add(lamp);
+  const poleM = new THREE.MeshStandardMaterial({ color: 3355443, roughness: 0.6, metalness: 0.5 });
+  const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.04, 0.05, 3.5, 10), poleM);
+  pole.position.set(-1.6, 1.75, 2.62);
+  const arm = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.06, 0.45), poleM);
+  arm.position.set(-1.6, 3.48, 2.4);
+  const lampBulb = new THREE.Mesh(new THREE.CylinderGeometry(0.09, 0.13, 0.08, 16), new THREE.MeshStandardMaterial({ color: 2236962, emissive: 16751939, emissiveIntensity: 0, roughness: 0.5 }));
+  lampBulb.position.set(-1.6, 3.42, 2.22);
+  pole.castShadow = true;
+  scene.add(pole, arm, lampBulb);
+  return { stars, moon, lamp, lampBulb };
 }
 function buildRange(scene) {
   const grp = new THREE.Group();

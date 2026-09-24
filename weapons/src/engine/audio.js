@@ -196,120 +196,62 @@ var GunAudio = class {
   shot(o = {}) {
     if (!this.ctx || this.muted) return;
     const c = this.ctx, t = c.currentTime + 5e-3;
-    const P = this.params();
+    const fam = this.shotFamily();
     const supp = this.muzzle === "supp";
-    const M2 = MUZ[this.muzzle] || MUZ.fh;
-    const v = 0.92 + Math.random() * 0.16;
-    // первый выстрел через холодный глушитель громче: кислород в камерах догорает
-    const frp = supp && t - this.lastShot > 3 ? 1.9 : 1;
+    // холодный глушитель: первый выстрел громче (кислород в камерах догорает)
+    const cold = supp && t - this.lastShot > 3;
     this.lastShot = t;
-    const L = P.level * v * (o.gain ?? 1);
-    {
-      const s = this.src(this.noise, t, 0.6, 0.9 + Math.random() * 0.2);
-      const lp = c.createBiquadFilter();
-      lp.type = "lowpass";
-      lp.frequency.setValueAtTime(P.blastF * M2.lp * (0.9 + Math.random() * 0.2), t);
-      lp.frequency.exponentialRampToValueAtTime(Math.max(300, P.blastF * M2.lp * 0.18), t + P.blastT * 2.5);
-      const hp = c.createBiquadFilter();
-      hp.type = "highpass";
-      hp.frequency.value = supp ? 90 : 55;
-      const g = c.createGain();
-      this.env(g, t, M2.attack, 1.25 * L * M2.blast * frp, P.blastT * M2.tail, 0.7);
-      s.connect(lp).connect(hp).connect(g);
-      this.out(g, 0.9 * M2.wet);
-    }
-    const harsh = M2.harsh + (P.harsh || 0);
-    if (harsh > 0 && !supp) {
-      const s = this.src(this.noise, t, 0.25);
-      const bp = c.createBiquadFilter();
-      bp.type = "bandpass";
-      bp.frequency.value = 2600;
-      bp.Q.value = 1.2;
-      const g = c.createGain();
-      this.env(g, t, 4e-4, 0.9 * L * harsh, 0.035, 0.3);
-      s.connect(bp).connect(g);
-      this.out(g, 0.6 * M2.wet);
-    }
-    {
-      // удар давления: полпериода-период низкой частоты с быстрым спадом (не тон)
-      const osc = c.createOscillator();
-      osc.type = "sine";
-      const f = P.bodyF * (supp ? 0.8 : 1) * (0.95 + Math.random() * 0.1);
-      osc.frequency.setValueAtTime(f, t);
-      osc.frequency.exponentialRampToValueAtTime(f * 0.33, t + P.bodyT);
-      const g = c.createGain();
-      this.env(g, t, 2e-3, 1.1 * L * P.body * M2.body * frp, P.bodyT * 0.5, P.bodyT * 3);
-      const ws = c.createWaveShaper();
-      ws.curve = this.softclip || (this.softclip = (() => {
-        const a = new Float32Array(256);
-        for (let i = 0; i < 256; i++) a[i] = Math.tanh((i / 128 - 1) * 2.2);
-        return a;
-      })());
-      osc.connect(ws).connect(g);
-      this.out(g, 0.35 * M2.wet);
-      osc.start(t);
-      osc.stop(t + P.bodyT * 3 + 0.05);
-      const s = this.src(this.pink, t, 0.3);
-      const lp = c.createBiquadFilter();
-      lp.type = "lowpass";
-      lp.frequency.value = supp ? 380 : 700;
-      const g2 = c.createGain();
-      this.env(g2, t, 1e-3, 1.6 * L * P.body * M2.body * frp, P.bodyT * 0.7, 0.35);
-      s.connect(lp).connect(g2);
-      this.out(g2, 0.5 * M2.wet);
-    }
-    // с глушителем 9 мм стреляют дозвуковыми — щелчка пули нет
-    const crack = supp && P.subSupp ? 0 : P.crack * M2.crack;
-    if (crack > 0) {
-      const s = c.createBufferSource();
-      s.buffer = this.crackBuf;
-      const hp = c.createBiquadFilter();
-      hp.type = "highpass";
-      hp.frequency.value = 1800;
-      const g = c.createGain();
-      g.gain.value = 0.55 * crack * v;
-      s.connect(hp).connect(g);
-      this.out(g, 0.25);
-      s.start(t + 2e-3);
-    }
-    if (supp) {
-      // выхлоп газа из окна/казённика и «пфф» из торца глушителя
-      const s = this.src(this.noise, t, 0.2);
-      const bp = c.createBiquadFilter();
-      bp.type = "bandpass";
-      bp.frequency.value = 1400;
-      bp.Q.value = 0.8;
-      const g = c.createGain();
-      this.env(g, t + 2e-3, 3e-3, 0.22 * L, 0.03, 0.2);
-      s.connect(bp).connect(g);
-      this.out(g, 0.1);
-    }
-    {
-      const mech = (this.profile.mech ?? 0.8) * (supp ? 1.3 : 1);
-      const P2 = this.profile;
-      if (P2.family !== "m870") {
-        const s = c.createBufferSource();
-        s.buffer = this.foley.buffer("cycle", { fam: P2.family, rpm: P2.rpm });
-        const g = c.createGain();
-        g.gain.value = 0.55 * mech;
-        s.connect(g);
-        this.out(g, 0.05, 0.12);
-        s.start(t + 1e-3);
+    const buf = this.shotBuffer(fam, this.muzzle, cold);
+    const s = c.createBufferSource();
+    s.buffer = buf;
+    s.playbackRate.value = 0.975 + Math.random() * 0.05;
+    const g = c.createGain();
+    g.gain.value = (supp ? SUPP_LEVEL[fam] ?? 0.4 : SHOT_LEVEL[fam] ?? 0.9) * (o.gain ?? 1) * 1.15;
+    s.connect(g).connect(this.dry);
+    s.start(t);
+  }
+  shotFamily() {
+    const f = this.profile.family;
+    return SHOT[f] ? f : this.profile.cal === "12ga" ? "m870" : this.profile.cal === "9x19" ? "mp5" : this.profile.cal === "762x54R" ? "svd" : "ak";
+  }
+  // Буферы выстрела: 3 варианта на (оружие, дульное устройство); вариант 0 у глушителя — «холодный».
+  shotBuffer(fam, muzzle, cold) {
+    this.shots = this.shots || new Map();
+    const key = fam + "|" + muzzle;
+    let list = this.shots.get(key);
+    if (!list) {
+      list = [];
+      const sr = this.ctx.sampleRate;
+      for (let v = 0; v < 3; v++) {
+        const [l, r] = renderGunshot(sr, fam, muzzle, this.profile.cal, v);
+        const b = this.ctx.createBuffer(2, l.length, sr);
+        b.getChannelData(0).set(l);
+        b.getChannelData(1).set(r);
+        list.push(b);
       }
+      this.shots.set(key, list);
     }
-    if (!supp) {
-      // эхо от вала и от лесополосы
-      for (const [dt, a, f] of [[0.34, 0.14, 900], [0.92, 0.06, 600]]) {
-        const s = this.src(this.pink, t + dt, 0.3);
-        const lp = c.createBiquadFilter();
-        lp.type = "lowpass";
-        lp.frequency.value = f;
-        const g = c.createGain();
-        this.env(g, t + dt, 0.01, a * L * M2.wet * (0.6 + P.body * 0.4), 0.09 + P.blastT * 0.4, 0.34);
-        s.connect(lp).connect(g);
-        this.out(g, 0.6, -0.2);
-      }
-    }
+    if (muzzle === "supp") return cold ? list[0] : list[1 + (Math.random() * 2 | 0)];
+    return list[Math.random() * list.length | 0];
+  }
+  // Кнопка фонаря на торце: резиновый колпачок — глухой «тык» и щелчок микропереключателя.
+  tailcap(on) {
+    if (!this.ctx || this.muted) return;
+    const t = this.ctx.currentTime;
+    this.thud(t, 1800, 0.12, 0.012, 0);
+    this.clank(t + 4e-3, on ? 5200 : 4600, 0.1, 8e-3, 4, 0.1, 0.02);
+  }
+  // Замена батарей: отвернуть крышку, вытряхнуть CR123, вставить, завернуть.
+  batteryChange() {
+    if (!this.ctx || this.muted) return;
+    const t = this.ctx.currentTime;
+    for (let i = 0; i < 5; i++) this.slide(t + i * 0.07, 2600, 3400, 0.05, 0.05, 0.05);
+    this.clank(t + 0.42, 3200, 0.12, 0.02, 3, 0.2);
+    this.clank(t + 0.47, 2900, 0.1, 0.02, 3, 0.25);
+    this.thud(t + 0.8, 1500, 0.15, 0.02, 0);
+    this.thud(t + 0.9, 1500, 0.15, 0.02, 0);
+    for (let i = 0; i < 5; i++) this.slide(t + 1.05 + i * 0.07, 3400, 2600, 0.05, 0.05, 0.05);
+    this.clank(t + 1.45, 4200, 0.12, 0.012, 4, 0);
   }
   play(name, o = {}) {
     if (!this.ctx || this.muted) return;
@@ -378,6 +320,7 @@ var GunAudio = class {
     for (const n of ["dryFire", "selector", "click", "hkLock", "boltSlam"]) this.foley.buffer(n, o);
     for (const kind of ["brass", "steel", "hull"]) this.foley.buffer("casing", { ...o, kind });
     this.foley.buffer("cycle", { fam: P.family, rpm: P.rpm });
+    this.shotBuffer(this.shotFamily(), this.muzzle || "bare");
   }
   // Установка модуля: щелчки прижима или храповик резьбы.
   attach(kind) {

@@ -73,16 +73,33 @@ function mp5Barrel(ctx, k) {
   k.add("steelMatte", exZ([[168, 6], [181, 6], [181, TY - 4], [168, TY - 4]], 10, { bevel: 0.6 }));
 }
 function mp5RearSight(ctx, k) {
-  const { extrudeZ: exZ, cylY: cY, flutesX: fl, T: T2, box: bx, cylX: cX } = ctx.G;
+  const { extrudeZ: exZ, extrudeX: exX, cylY: cY, latheX: lX, flutesX: fl, T: T2, box: bx, shape: sh, circle: ci, rrect: rr } = ctx.G;
   const { TOP, SIGHT_Y: SY, REAR_X: RX } = H5;
-  // основание и поворотный барабан (ось вертикальная, в стенке — диоптры разного диаметра)
-  k.add("steelMatte", exZ([[RX - 16, TOP - 1], [RX + 22, TOP - 1], [RX + 18, TOP + 4, 2], [RX - 14, TOP + 5, 2]], 24, { bevel: 1 }));
-  for (const s of [-1, 1]) k.add("steelMatte", exZ([[RX - 10, TOP + 3], [RX + 8, TOP + 3], [RX + 6, SY + 7, 2], [RX - 8, SY + 7, 2]], 2.4, { bevel: 0.4, z: s * 12.4 }));
-  k.add("steelMatte", T2(cY(10.2, TOP + 3, SY + 6, { c: 1, seg: 32 }), { p: [RX, 0, 0] }));
-  k.add("steelMatte", T2(fl(9.9, 0, SY + 6 - TOP - 6, 28, 1.2, 0.7), { r: [0, 0, 90], p: [RX, TOP + 4, 0] }));
-  k.add("lensBlack", T2(cX(1.5, RX - 10.6, RX - 9.8, { seg: 16 }), { p: [0, SY, 0] }));
-  k.add("lensBlack", T2(cX(2.2, RX + 9.8, RX + 10.6, { seg: 16 }), { p: [0, SY, 0] }));
-  k.add("paintWhite", T2(bx(0.6, 3, 0.6), { p: [RX, SY + 2, 10.3] }));
+  const M = "steelMatte";
+  // основание и поворотный барабан (ось вертикальная). Барабан полый: диоптр — настоящее
+  // сквозное отверстие, через него видно кольцо мушки (раньше это был чёрный кружок).
+  k.add(M, exZ([[RX - 16, TOP - 1], [RX + 22, TOP - 1], [RX + 18, TOP + 4, 2], [RX - 14, TOP + 5, 2]], 24, { bevel: 1 }));
+  for (const s of [-1, 1]) k.add(M, exZ([[RX - 10, TOP + 3], [RX + 8, TOP + 3], [RX + 6, SY + 7, 2], [RX - 8, SY + 7, 2]], 2.4, { bevel: 0.4, z: s * 12.4 }));
+  const R = 10.2, Ri = 8.6, hb = 4.2, gap = Math.asin(hb / R) * 180 / Math.PI;
+  const drumY = (y0, y1, o = {}) => T2(lX([[y0, o.capLo ? 0 : Ri], [y0, R - 0.6], [y0 + 0.6, R], [y1 - 0.6, R], [y1, R - 0.6], [y1, o.capHi ? 0 : Ri], ...(o.capHi || o.capLo ? [] : [[y0, Ri]])], { seg: 40, a0: o.a0, arc: o.arc }), { r: [0, 0, 90], p: [RX, 0, 0] });
+  k.add(M, drumY(TOP + 3, SY - hb, { capLo: true }));
+  k.add(M, drumY(SY + hb, SY + 6, { capHi: true }));
+  for (const a of [gap, 180 + gap]) k.add(M, drumY(SY - hb, SY + hb, { a0: a, arc: 180 - 2 * gap }));
+  // рифление по окружности барабана — только вне окон диоптров
+  const fls = [];
+  for (let i = 0; i < 28; i++) {
+    const a = i / 28 * 360;
+    if (Math.abs(((a + 90) % 180) - 90) < gap + 8) continue;
+    fls.push(T2(T2(bx(SY + 6 - TOP - 7, 0.7, 1.2, { bevel: 0.25 }), { p: [(SY + 6 + TOP + 3) / 2, R + 0.15, 0] }), { r: [a, 0, 0] }));
+  }
+  k.add(M, T2(ctx.G.merge(fls), { r: [0, 0, 90], p: [RX, 0, 0] }));
+  // рабочий диоптр со стороны глаза (Ø3,6) и широкое окно спереди — не ограничивает поле
+  const plate = (x0, x1, rh) => exX(sh(rr(0, SY, 2 * hb + 0.6, 2 * hb + 0.6, 0.8), [ci(0, SY, rh, 28).reverse()]), x0, x1, { bevel: 0.25 });
+  k.add(M, plate(RX - R + 0.2, RX - Ri + 0.4, 1.8));
+  k.add(M, plate(RX + Ri - 0.4, RX + R - 0.2, 3.4));
+  k.add("steelWorn", T2(lX([[0, 1.8], [0, 2.5], [0.5, 2.5], [0.5, 1.8]], { seg: 28 }), { p: [RX - R, SY, 0] }));
+  k.add("lensBlack", T2(cY(Ri - 0.3, SY - hb - 0.05, SY - hb + 0.1, { seg: 32 }), { p: [RX, 0, 0] }));
+  k.add("paintWhite", T2(bx(0.6, 3, 0.6), { p: [RX, SY + hb + 1.4, R + 0.1] }));
 }
 function mp5Base(ctx) {
   const { node: nd, T: T2, box: bx, cylZ: cZ, cylY: cY, latheX: lX, extrudeZ: exZ } = ctx.G;
@@ -90,7 +107,9 @@ function mp5Base(ctx) {
   const nodes = {};
   mp5Receiver(ctx, k);
   mp5Barrel(ctx, k);
-  mp5RearSight(ctx, k);
+  const rs = ctx.kit();
+  mp5RearSight(ctx, rs);
+  nodes.rearSight = nd("rearSight", [rs.build()]);
   const body = k.build("receiver");
   // затвор в окне выброса
   const c = ctx.kit();
@@ -104,7 +123,7 @@ function mp5Base(ctx) {
   h.add("steelWorn", T2(lX([[0, 0], [0, 4.6], [1.5, 5.4], [8, 5.4], [9, 4.2], [9, 0]], { seg: 18 }), { r: [0, 90, 0], p: [0, 0, -H5.TUBE_R - 16] }));
   h.add("polySoft", T2(cY(5.8, -3.4, 3.4, { c: 1, seg: 18 }), { p: [-2, 0, -H5.TUBE_R - 22] }));
   nodes.handle = nd("handle", [h.build()], { p: [150, H5.TUBE_Y, 0] });
-  const root = nd("mp5a3", [body, nodes.carrier, nodes.handle]);
+  const root = nd("mp5a3", [body, nodes.rearSight, nodes.carrier, nodes.handle]);
   const { mount: mount2 } = ctx;
   root.add(mount2({ id: "hg", type: "hg", p: [0, 0, 0] }));
   root.add(mount2({ id: "claw", type: "claw", p: [-96, H5.TOP, 0] }));
@@ -118,7 +137,7 @@ function mp5Base(ctx) {
     anim: { carrierTravel: 62, handleTravel: 92, handleLock: 32, triggerAngle: 0.2 },
     eject: { p: [-20, 6, 18], dir: [0.45, 0.35, 1], speed: 4.2 },
     muzzle: [H5.MUZZLE, 0, 0],
-    irons: { rear: [H5.REAR_X, H5.SIGHT_Y, 0], front: [H5.FRONT_X, H5.SIGHT_Y, 0], type: "aperture" },
+    irons: { rear: [H5.REAR_X - 10, H5.SIGHT_Y, 0], front: [H5.FRONT_X, H5.SIGHT_Y, 0], type: "aperture", eye: 34, hole: 1.8 },
     eyeX: -300,
     focus: { center: [-90, -30, 0], size: 760 }
   };
@@ -203,9 +222,15 @@ function mp5Trigger(ctx, o) {
   // корпус под коробкой: от штифта (x=0) назад
   k.add(M, exZ([[4, 0], [-176, 0], [-176, -10, 3], [-160, -14, 4], [4, -14, 3]], 32, { bevel: 1.4 }));
   // рукоять под углом, со спинкой и выемками под пальцы
-  const g = [[-120, -12], [-112, -40, 6], [-118, -58, 10], [-114, -76, 8], [-122, -106, 8], [-160, -108, 8], [-162, -80, 12], [-156, -40, 12], [-164, -12, 6]];
-  k.add(M, exZ(g.map(([x, y, r]) => [x, y, r || 0]), 30, { bevel: 6, curve: 8 }));
-  for (let i = 0; i < 8; i++) for (const s of [-1, 1]) k.add(M, T2(bx(1.2, 30, 1, { bevel: 0.3 }), { p: [-150 + i * 3.2 - (i * 1.4), -70, s * 14.6], r: [0, 0, -14] }));
+  // рукоять SEF: наклон ≈12°, три выемки под пальцы спереди, «горб» под ладонь сзади, расширение у пятки
+  const gy = [-8, -22, -34, -44, -52, -60, -68, -76, -84, -93, -101, -106, -109];
+  const ga = [22, 21.5, 19, 21.5, 19.2, 21.8, 19.2, 21.5, 19.6, 21, 21.5, 20, 16];
+  const g2 = [23, 23, 23.5, 24.5, 25, 25, 24.6, 24, 23.4, 23, 23.4, 22.5, 18];
+  const gb = [15, 15, 14.8, 15, 15.2, 15.4, 15.4, 15.2, 15, 15, 15.4, 15, 12];
+  const secs = gy.map((y, i) => ({ c: [-140 + (y + 8) * 0.21, y], a: ga[i], a2: g2[i], b: gb[i], k: 2.6, kb: 3.2 }));
+  k.add(o.gripMat || "polyGrip", ctx.G.loftPath(secs, { seg: 40 }));
+  // пятка рукояти — крышка с антабкой-проушиной
+  k.add(M, T2(exZ([[-8, 0, 2], [44, 0, 2], [42, -4, 2], [-6, -4, 2]], 26, { bevel: 1.4 }), { p: [-181, -107, 0], r: [0, 0, -12] }));
   // спусковая скоба
   k.add(M, exZ(sh([[-44, -12], [-114, -12], [-110, -46, 8], [-60, -50, 10], [-44, -34, 6]], [[[-52, -16], [-106, -16], [-104, -40, 6], [-64, -44, 8], [-54, -32, 4]]]), 14, { bevel: 1.2 }));
   k.add("steelWorn", T2(cZ(3, -17, 17, { seg: 14 }), { p: [-8, -6, 0] }));
@@ -233,18 +258,20 @@ function stockA3(ctx) {
   const { extrudeZ: exZ, extrudeX: exX, T: T2, box: bx, cylX: cX, node: nd, cylZ: cZ } = ctx.G;
   const k = ctx.kit(), sl = ctx.kit();
   // направляющие в пазах коробки — видны по бортам
-  for (const s of [-1, 1]) sl.add("steel", T2(exX([[-3.2, -3], [3.2, -3], [3.2, 3], [-3.2, 3]].map(([z, y]) => [z, y, 1]), -300, 70, { bevel: 0.6 }), { p: [0, 2, s * (H5.HW + 3.2)] }));
+  // длина по реальному A3: 700 мм выдвинут / 550 мм сложен (ход 150)
+  for (const s of [-1, 1]) sl.add("steel", T2(exX([[-3.2, -3], [3.2, -3], [3.2, 3], [-3.2, 3]].map(([z, y]) => [z, y, 1]), -246, 60, { bevel: 0.6 }), { p: [0, 2, s * (H5.HW + 3.2)] }));
   // затыльник с резиновой накладкой
-  sl.add("steel", T2(exZ([[-2, 24, 3], [8, 24, 3], [8, -86, 6], [-2, -88, 6]], 44, { bevel: 2 }), { p: [-306, 0, 0] }));
-  sl.add("rubber", T2(exZ([[-3, 26, 6], [3, 26, 6], [3, -92, 8], [-3, -92, 8]], 48, { bevel: 2.5 }), { p: [-312, 0, 0] }));
-  for (const s of [-1, 1]) sl.add("steel", exZ([[-300, 4], [-300, -4], [-306, -28, 2], [-306, -20]], 3, { bevel: 0.6, z: s * 20 }));
-  sl.add("steelWorn", T2(cZ(4, -22, 22, { seg: 16 }), { p: [-300, -60, 0] }));
+  sl.add("steel", T2(exZ([[-2, 24, 3], [8, 24, 3], [8, -86, 6], [-2, -88, 6]], 44, { bevel: 2 }), { p: [-250, 0, 0] }));
+  sl.add("rubber", T2(exZ([[-3, 26, 6], [3, 26, 6], [3, -92, 8], [-3, -92, 8]], 48, { bevel: 2.5 }), { p: [-256, 0, 0] }));
+  for (let i = 0; i < 7; i++) sl.add("rubber", T2(bx(1.4, 2, 42), { p: [-259.4, 16 - i * 15, 0] }));
+  for (const s of [-1, 1]) sl.add("steel", exZ([[-244, 4], [-244, -4], [-250, -28, 2], [-250, -20]], 3, { bevel: 0.6, z: s * 20 }));
+  sl.add("steelWorn", T2(cZ(4, -22, 22, { seg: 16 }), { p: [-244, -60, 0] }));
   const slide = nd("a3slide", [sl.build()]);
   // защёлка на торце коробки
   k.add("steel", exZ([[0, 20], [-12, 20], [-12, -16, 3], [0, -16]], 40, { bevel: 1.2 }));
   k.add("steelWorn", T2(cZ(4.4, -24, 24, { seg: 18 }), { p: [-8, -8, 0] }));
   k.add("steel", T2(bx(10, 6, 12, { bevel: 1 }), { p: [-16, 22, 0] }));
-  return { root: nd("a3", [k.build(), slide]), fold: { node: slide, slide: 152 } };
+  return { root: nd("a3", [k.build(), slide]), fold: { node: slide, slide: 150 } };
 }
 function stockA2(ctx) {
   const { extrudeZ: exZ, T: T2, box: bx, cylZ: cZ, node: nd, loftX: lf, superEllipse: se } = ctx.G;

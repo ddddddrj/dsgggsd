@@ -17,6 +17,7 @@ __export(geo_exports, {
   flutesX: () => flutesX,
   latheX: () => latheX,
   loftX: () => loftX,
+  loftPath: () => loftPath,
   merge: () => merge,
   mirrorZ: () => mirrorZ,
   mlokHoles: () => mlokHoles,
@@ -463,6 +464,66 @@ function loftX(rings, o = {}) {
   }
   ng.setAttribute("uv", new THREE3.BufferAttribute(uv, 2));
   return toCreasedNormals(ng, (o.crease ?? 40) * D2R);
+}
+// Лофт по кривой оси в плоскости XY (рукояти, шейки прикладов). secs: [{c:[x,y], a, b, k?, f?, r?}]
+// a — полутолщина вдоль нормали к оси (спереди/сзади), b — полуширина по Z, f — смещение центра
+// сечения вдоль нормали (выемки под пальцы, горб), r — радиус-скругление передней грани (0…1: доля a).
+function loftPath(secs, o = {}) {
+  const n = o.seg ?? 36, m = secs.length;
+  const pos = [], idx = [];
+  const tan = (i) => {
+    const a = secs[Math.max(0, i - 1)].c, b = secs[Math.min(m - 1, i + 1)].c;
+    const dx = b[0] - a[0], dy = b[1] - a[1], l = Math.hypot(dx, dy) || 1;
+    return [dx / l, dy / l];
+  };
+  for (let i = 0; i < m; i++) {
+    const S2 = secs[i], [tx, ty] = tan(i), nx = -ty, ny = tx, k = S2.k ?? o.k ?? 3, kb = S2.kb ?? k;
+    for (let j = 0; j < n; j++) {
+      const t = j / n * Math.PI * 2, c = Math.cos(t), s2 = Math.sin(t);
+      // передняя (c>0) и задняя половины могут иметь разную толщину: a — вперёд, a2 — назад
+      const aa = c >= 0 ? S2.a : S2.a2 ?? S2.a;
+      const u = aa * Math.sign(c) * Math.pow(Math.abs(c), 2 / (c >= 0 ? k : kb)) + (S2.f || 0);
+      const w = S2.b * Math.sign(s2) * Math.pow(Math.abs(s2), 2 / k);
+      pos.push(S2.c[0] + nx * u, S2.c[1] + ny * u, w);
+    }
+  }
+  for (let i = 0; i < m - 1; i++) for (let j = 0; j < n; j++) {
+    const a = i * n + j, b = i * n + (j + 1) % n, c = (i + 1) * n + j, d = (i + 1) * n + (j + 1) % n;
+    idx.push(a, c, b, b, c, d);
+  }
+  const cap = (ri, flip) => {
+    const base = pos.length / 3;
+    let cx = 0, cy = 0;
+    for (let j = 0; j < n; j++) cx += pos[(ri * n + j) * 3] / n, cy += pos[(ri * n + j) * 3 + 1] / n;
+    pos.push(cx, cy, 0);
+    for (let j = 0; j < n; j++) {
+      const a = ri * n + j, b = ri * n + (j + 1) % n;
+      flip ? idx.push(base, a, b) : idx.push(base, b, a);
+    }
+  };
+  if (o.caps !== false) {
+    cap(0, false);
+    cap(m - 1, true);
+  }
+  const g = new THREE3.BufferGeometry();
+  g.setAttribute("position", new THREE3.Float32BufferAttribute(pos, 3));
+  g.setIndex(idx);
+  if (o.flip) {
+    const ix = g.index.array;
+    for (let i = 0; i < ix.length; i += 3) {
+      const t = ix[i + 1];
+      ix[i + 1] = ix[i + 2];
+      ix[i + 2] = t;
+    }
+  }
+  const ng = g.toNonIndexed();
+  const p = ng.attributes.position, uv = new Float32Array(p.count * 2);
+  for (let i = 0; i < p.count; i++) {
+    uv[i * 2] = p.getX(i) + p.getZ(i) * 0.3;
+    uv[i * 2 + 1] = p.getY(i) + p.getZ(i);
+  }
+  ng.setAttribute("uv", new THREE3.BufferAttribute(uv, 2));
+  return toCreasedNormals(ng, (o.crease ?? 60) * D2R);
 }
 function superEllipse(a, b, k = 3, n = 32, cy = 0, cz = 0) {
   const out = [];

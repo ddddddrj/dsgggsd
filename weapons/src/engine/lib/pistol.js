@@ -63,16 +63,14 @@ function pistolLight(ctx, o) {
   for (const s of [-1, 1]) k.add(o.mat || "alu", extrudeX([[s * 9.6, -1], [s * 12, -1], [s * 12, 1.5], [s * 9.6, 1.5]], -14, 12, { bevel: 0.3 }));
   k.add("steel", T(box(4, 3, 16), { p: [0, -0.6, 0] }));
   k.add(o.mat || "alu", extrudeX(rrect(0, cy, w, h, Math.min(w, h) * 0.3), x0, x1 - 14, { bevel: 1.6 }));
-  k.add(o.mat || "alu", T(latheX([[x1 - 16, 0], [x1 - 16, h * 0.46], [x1 - 10, headR], [x1, headR], [x1, headR - 1.6], [x1 - 1.2, 0]], { seg: 36 }), { p: [0, cy, 0] }));
+  k.add(o.mat || "alu", T(latheX([[x1 - 16, 0], [x1 - 16, h * 0.46], [x1 - 10, headR], [x1, headR], [x1, headR - 1.6], [x1 - 1, headR - 2.4]], { seg: 36 }), { p: [0, cy, 0] }));
   k.add("steel", T(tubeX(headR + 0.2, headR - 2.2, x1 - 2.4, x1 + 0.4, { seg: 36 }), { p: [0, cy, 0] }));
   // амбидекстральные клавиши сзади
   for (const s of [-1, 1]) k.add("poly", T(extrudeZ([[0, 0], [9, 0], [12, 7, 2], [0, 9, 2]], 4, { bevel: 0.8 }), { p: [x0 - 8, cy - 3, s * (w / 2 - 1)] }));
   const root = node(o.name, [k.build()]);
-  const le = lens(ctx, cylX(headR - 2.1, x1 - 1.2, x1 - 0.4, { seg: 32 }).translate(0, cy, 0), "lampLens");
-  le.renderOrder = 0;
-  le.material.transparent = false;
-  root.add(le);
-  const out = { root, light: { p: [x1 + 1, cy, 0], lens: le, lumens: o.lm } };
+  const head = lampHead(ctx, headR - 2.2, x1 - 0.6, x1 - (o.turbo ? 22 : 11), cy, o);
+  root.add(head.group);
+  const out = { root, light: { p: [x1 + 1, cy, 0], lens: head.glow, lumens: o.lm, cd: o.cd, hot: o.hot, spill: o.spill, kelvin: o.kelvin, batt: o.batt, lensR: headR - 2.2 } };
   if (o.laser) {
     const lk = ctx.kit();
     const lz = 0, ly = cy + h / 2 + 4;
@@ -91,8 +89,10 @@ var PISTOL = [
   { id: "rmr_t2", cat: "micro", name: "Trijicon RMR Type 2", desc: "Точка 3,25 MOA, самый живучий корпус", stats: { weight: 34, ergo: -1, adsTime: 10 }, build: rmrPistol },
   { id: "hs507c", cat: "micro", name: "Holosun HS507C X2", desc: "Кольцо 32 MOA + точка 2 MOA", stats: { weight: 43, ergo: -1, adsTime: 12 }, build: hs507 },
   { id: "acro_p2", cat: "micro", name: "Aimpoint ACRO P-2", desc: "Закрытый излучатель: грязь и вода не мешают", stats: { weight: 60, ergo: -2, adsTime: 14 }, build: acroP2 },
-  { id: "x300u", cat: "plight", name: "SureFire X300U-B", desc: "Фонарь 1000 лм, зацеп за паз рамки", foot: [-6, 6], body: [-20, 70], stats: { weight: 116, ergo: -3 }, build: (c) => pistolLight(c, { name: "x300", x0: -12, x1: 70, w: 30, h: 26, headR: 15.5, lm: 1e3 }) },
-  { id: "tlr7a", cat: "plight", name: "Streamlight TLR-7A", desc: "Компактный фонарь 500 лм", foot: [-6, 6], body: [-18, 52], stats: { weight: 71, ergo: -1 }, build: (c) => pistolLight(c, { name: "tlr7", x0: -10, x1: 52, w: 27, h: 22, headR: 12, lm: 500, mat: "poly" }) },
-  { id: "tlr8a", cat: "plight", name: "Streamlight TLR-8A", desc: "Фонарь 500 лм + красный ЛЦУ (C / Z)", foot: [-6, 6], body: [-18, 56], stats: { weight: 83, ergo: -2, "hipSpread%": -12 }, build: (c) => pistolLight(c, { name: "tlr8", x0: -10, x1: 56, w: 28, h: 23, headR: 12.5, lm: 500, laser: true, mat: "poly" }) }
+  { id: "x300u", cat: "plight", name: "SureFire X300U-B", desc: "Фонарь 1000 лм / 12 000 кд, зацеп за паз рамки", foot: [-6, 6], body: [-20, 70], stats: { weight: 116, ergo: -3 }, build: (c) => pistolLight(c, { name: "x300", x0: -12, x1: 70, w: 30, h: 26, headR: 15.5, lm: 1e3, cd: 12e3, hot: 0.2, spill: 0.12, kelvin: 6400, batt: 22 }) },
+  { id: "x300t", cat: "plight", name: "SureFire X300T-B Turbo", desc: "650 лм / 50 000 кд: узкий дальнобойный луч, длинная голова", foot: [-6, 6], body: [-20, 84], stats: { weight: 136, ergo: -4 }, build: (c) => pistolLight(c, { name: "x300t", x0: -12, x1: 84, w: 30, h: 26, headR: 19, lm: 650, cd: 5e4, hot: 0.08, spill: 0.04, kelvin: 6000, batt: 26, turbo: true }) },
+  { id: "tlr7a", cat: "plight", name: "Streamlight TLR-7A", desc: "Компактный фонарь 500 лм / 5000 кд", foot: [-6, 6], body: [-18, 52], stats: { weight: 71, ergo: -1 }, build: (c) => pistolLight(c, { name: "tlr7", x0: -10, x1: 52, w: 27, h: 22, headR: 12, lm: 500, cd: 5e3, hot: 0.24, spill: 0.14, kelvin: 6500, batt: 28, mat: "poly" }) },
+  { id: "tlr1hl", cat: "plight", name: "Streamlight TLR-1 HL", desc: "1000 лм / 13 000 кд, алюминиевый корпус", foot: [-6, 6], body: [-20, 74], stats: { weight: 122, ergo: -3 }, build: (c) => pistolLight(c, { name: "tlr1", x0: -12, x1: 74, w: 31, h: 25, headR: 15, lm: 1e3, cd: 13e3, hot: 0.19, spill: 0.11, kelvin: 5900, batt: 24 }) },
+  { id: "tlr8a", cat: "plight", name: "Streamlight TLR-8A", desc: "Фонарь 500 лм + красный ЛЦУ (C / Z)", foot: [-6, 6], body: [-18, 56], stats: { weight: 83, ergo: -2, "hipSpread%": -12 }, build: (c) => pistolLight(c, { name: "tlr8", x0: -10, x1: 56, w: 28, h: 23, headR: 12.5, lm: 500, cd: 6e3, laser: true, mat: "poly", batt: 25 }) }
 ];
 

@@ -101,6 +101,14 @@ body.noui .ui{display:none}
 .a-n sup{font-size:13px;color:var(--acc);margin-left:2px;vertical-align:14px}
 .a-n small{font-size:14px;color:var(--tx3);font-weight:600;margin-left:3px}
 .ammo.low .a-n{color:var(--bad)}
+.a-batt{display:flex;flex-direction:column;gap:4px;margin-left:4px;padding-left:12px;border-left:1px solid var(--line)}
+.a-batt .bt{display:grid;grid-template-columns:78px 54px 34px;align-items:center;gap:6px;font-size:11px;color:var(--tx3)}
+.a-batt .bt.on span{color:var(--tx)}
+.a-batt i{display:block;height:6px;border-radius:3px;background:rgba(255,255,255,.1);overflow:hidden}
+.a-batt em{display:block;height:100%;background:var(--good)}
+.a-batt .bt.low em{background:var(--bad)}
+.a-batt .bt.low b{color:var(--bad)}
+.a-batt b{font-weight:650;color:var(--tx2);text-align:right;font-variant-numeric:tabular-nums}
 .a-m{display:flex;flex-direction:column;gap:3px}
 .a-m b{font-size:12px;letter-spacing:.08em;color:var(--acc)}
 .a-m span{font-size:12px;color:var(--tx2)}
@@ -121,7 +129,7 @@ body.noui .ui{display:none}
 
 /* режим прицеливания: убираем лишнее */
 .ui.ads .col-left,.ui.ads .mods{opacity:0;pointer-events:none;transition:opacity .2s}
-.ui.ads .bar .btn:not(.fire):not([data-id=ads]):not([data-id=sight]):not([data-id=mag3]):not([data-id=light]):not([data-id=laser]){display:none}
+.ui.ads .bar .btn:not(.fire):not([data-id=ads]):not([data-id=sight]):not([data-id=mag3]):not([data-id=light]):not([data-id=laser]):not([data-id=time]){display:none}
 .ads-hint{position:fixed;left:50%;top:16px;transform:translateX(-50%);padding:8px 14px;border-radius:8px;background:rgba(18,20,24,.9);border:1px solid var(--line);font-size:12.5px;display:none;text-align:center}
 .ads-hint.on{display:block}
 .ads-hint span{display:block;margin-top:2px;color:var(--tx3);font-size:11.5px}
@@ -262,7 +270,96 @@ function createScene(canvasHost) {
     camera.updateProjectionMatrix();
     renderer.setSize(innerWidth, innerHeight);
   });
-  return { renderer, scene, camera, sun, range, env };
+  const S = { renderer, scene, camera, sun, range, env, hemi, rim, fill, sky };
+  S.night = buildNight(scene);
+  S.time = "day";
+  S.setTime = (m) => setTime(S, m);
+  return S;
+}
+// Время суток. Значения подобраны под ACES: днём солнце ≈4:1 к небу; ночью — только луна
+// (холодная, очень слабая), звёзды, дежурный натриевый фонарь у рубежа и свет оружейных фонарей.
+var TIMES = {
+  day: { sun: [16773340, 2.4], sunPos: [-2.2, 5.5, 3.2], hemi: [13623551, 6971466, 0.55], rim: 1.1, fill: 0.5, envI: 0.75, exp: 1, sky: [6125200, 12174281, 9210492], fog: [11845058, 60, 420], stars: 0, lamp: 0, beam: 0.06 },
+  dusk: { sun: [16750950, 0.85], sunPos: [-5.5, 0.9, 1.6], hemi: [7372964, 2890785, 0.22], rim: 0.35, fill: 0.12, envI: 0.26, exp: 1.12, sky: [2699098, 13273173, 3549226], fog: [7031908, 40, 320], stars: 0.25, lamp: 0.7, beam: 0.45 },
+  night: { sun: [9481471, 0.13], sunPos: [2.5, 4.5, -2.2], hemi: [1714746, 526344, 0.05], rim: 0, fill: 0, envI: 0.018, exp: 1.35, sky: [199442, 1122876, 263429], fog: [264981, 18, 190], stars: 1, lamp: 1, beam: 1 }
+};
+function setTime(S, m) {
+  const t = TIMES[m] || TIMES.day;
+  S.time = TIMES[m] ? m : "day";
+  S.sun.color.setHex(t.sun[0]);
+  S.sun.intensity = t.sun[1];
+  S.sun.position.set(...t.sunPos);
+  S.hemi.color.setHex(t.hemi[0]);
+  S.hemi.groundColor.setHex(t.hemi[1]);
+  S.hemi.intensity = t.hemi[2];
+  S.rim.intensity = t.rim;
+  S.fill.intensity = t.fill;
+  S.scene.environmentIntensity = t.envI;
+  S.renderer.toneMappingExposure = t.exp;
+  const u = S.sky.material.uniforms;
+  u.top.value.setHex(t.sky[0]);
+  u.mid.value.setHex(t.sky[1]);
+  u.bot.value.setHex(t.sky[2]);
+  S.scene.fog.color.setHex(t.fog[0]);
+  S.scene.fog.near = t.fog[1];
+  S.scene.fog.far = t.fog[2];
+  const N = S.night;
+  N.stars.material.opacity = t.stars;
+  N.stars.visible = N.moon.visible = t.stars > 0;
+  N.moon.material.opacity = m === "night" ? 1 : 0.35;
+  N.lamp.intensity = 34 * t.lamp;
+  N.lampBulb.material.emissiveIntensity = 4 * t.lamp;
+  S.beamK = t.beam;
+}
+function buildNight(scene) {
+  const n = 1800, pos = new Float32Array(n * 3), col = new Float32Array(n * 3);
+  for (let i = 0; i < n; i++) {
+    const u = Math.random(), v = Math.random() * 0.96 + 0.04;
+    const th = u * Math.PI * 2, y = Math.pow(v, 0.8), r = Math.sqrt(1 - y * y);
+    pos.set([Math.cos(th) * r * 850, y * 850, Math.sin(th) * r * 850], i * 3);
+    const b = 0.25 + Math.pow(Math.random(), 6) * 1.6, w = Math.random();
+    col.set([b * (0.85 + w * 0.15), b * 0.92, b * (1.05 - w * 0.2)], i * 3);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+  g.setAttribute("color", new THREE.BufferAttribute(col, 3));
+  const stars = new THREE.Points(g, new THREE.PointsMaterial({ size: 1.6, sizeAttenuation: false, vertexColors: true, transparent: true, opacity: 0, depthWrite: false, fog: false, toneMapped: false }));
+  stars.visible = false;
+  scene.add(stars);
+  const mt = canvasTex(128, 128, (c, w) => {
+    const gr = c.createRadialGradient(w / 2, w / 2, w * 0.12, w / 2, w / 2, w / 2);
+    gr.addColorStop(0, "rgba(235,240,255,1)");
+    gr.addColorStop(0.2, "rgba(210,222,255,.95)");
+    gr.addColorStop(0.24, "rgba(170,190,240,.25)");
+    gr.addColorStop(1, "rgba(120,140,220,0)");
+    c.fillStyle = gr;
+    c.fillRect(0, 0, w, w);
+    for (let i = 0; i < 9; i++) {
+      c.fillStyle = `rgba(150,160,185,${0.25 + Math.random() * 0.2})`;
+      c.beginPath();
+      c.arc(w / 2 + (Math.random() - 0.5) * 18, w / 2 + (Math.random() - 0.5) * 18, 2 + Math.random() * 4, 0, 7);
+      c.fill();
+    }
+  });
+  const moon = new THREE.Sprite(new THREE.SpriteMaterial({ map: mt, transparent: true, depthWrite: false, fog: false, toneMapped: false }));
+  moon.position.set(2.5, 4.5, -2.2).normalize().multiplyScalar(820);
+  moon.scale.setScalar(110);
+  moon.visible = false;
+  scene.add(moon);
+  // дежурный фонарь над рубежом: натрий, тёплый, слабый — оружие ночью видно, мишени нет
+  const lamp = new THREE.PointLight(16751939, 0, 14, 2);
+  lamp.position.set(-1.6, 3.3, 2.2);
+  scene.add(lamp);
+  const poleM = new THREE.MeshStandardMaterial({ color: 3355443, roughness: 0.6, metalness: 0.5 });
+  const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.04, 0.05, 3.5, 10), poleM);
+  pole.position.set(-1.6, 1.75, 2.62);
+  const arm = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.06, 0.45), poleM);
+  arm.position.set(-1.6, 3.48, 2.4);
+  const lampBulb = new THREE.Mesh(new THREE.CylinderGeometry(0.09, 0.13, 0.08, 16), new THREE.MeshStandardMaterial({ color: 2236962, emissive: 16751939, emissiveIntensity: 0, roughness: 0.5 }));
+  lampBulb.position.set(-1.6, 3.42, 2.22);
+  pole.castShadow = true;
+  scene.add(pole, arm, lampBulb);
+  return { stars, moon, lamp, lampBulb };
 }
 function buildRange(scene) {
   const grp = new THREE.Group();
@@ -476,23 +573,31 @@ function makeTextures() {
   for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) brushed[y * S + x] = br[y * S + x * 7 % S] * 0.3 + br[y * 3 % S * S + x] * 0.7;
   const mix = new Float32Array(S * S);
   for (let i = 0; i < mix.length; i++) mix[i] = coarse[i] * 0.55 + fine[i] * 0.45;
-  const wood = (hue) => {
-    const n = fbm(S, 4, 301, 4), n2 = fbm(S, 3, 555, 16);
+  // Древесина: прямые продольные волокна (u — вдоль детали), лёгкая волнистость, годовые слои
+  // широкими полосами, поры-штрихи и неравномерная пропитка лаком. Раньше были «кольца» от шума —
+  // на прикладе СВД выглядело как огненный мрамор.
+  const wood = (hue, o = {}) => {
+    const warp = fbm(S, 3, o.seed ?? 301, 2), n2 = fbm(S, 4, (o.seed ?? 301) + 254, 8), blot = fbm(S, 3, (o.seed ?? 301) + 91, 3);
+    const pr = rng((o.seed ?? 301) * 7 + 1);
+    const pores = new Float32Array(S * S);
+    for (let i = 0; i < S * 5; i++) {
+      const x = pr() * S | 0, y = pr() * S | 0, L = 3 + pr() * 12 | 0;
+      for (let j = 0; j < L; j++) pores[y * S + (x + j) % S] = 0.5 + pr() * 0.5;
+    }
     return toTex(S, (i) => {
       const x = i % S, y = i / S | 0;
-      const v = y / S + n[i] * 0.35 + n2[i] * 0.04;
-      const ring = Math.pow(Math.abs(Math.sin(v * Math.PI * 9)), 6);
-      const fib = n2[y * S + x * 5 % S] * 0.25;
-      const k = 0.82 + fib * 0.6 - ring * 0.17 + (coarse[i] - 0.5) * 0.12;
+      const v = y / S + (warp[i] - 0.5) * (o.warp ?? 0.05);
+      const fine = Math.sin(v * Math.PI * 2 * (o.lines ?? 46)) * 0.5 + 0.5;
+      const late = Math.pow(Math.sin(v * Math.PI * 2 * (o.rings ?? 7)) * 0.5 + 0.5, 3);
+      const k = 0.9 - late * 0.16 - fine * 0.06 + (n2[i] - 0.5) * 0.12 - pores[i] * 0.2 - (blot[i] - 0.5) * (o.blot ?? 0.22);
       return [hue[0] * k, hue[1] * k, hue[2] * k];
     }, true);
-  };
-  const woodH = new Float32Array(S * S);
+  };  const woodH = new Float32Array(S * S);
   {
     const n = fbm(S, 4, 301, 4);
     for (let i = 0; i < S * S; i++) {
       const y = (i / S | 0) / S;
-      woodH[i] = Math.pow(Math.abs(Math.sin((y + n[i] * 0.35) * Math.PI * 9)), 6);
+      woodH[i] = 0.5 + 0.5 * Math.sin((y + (n[i] - 0.5) * 0.035) * Math.PI * 2 * 60) * 0.35 + (n[i] - 0.5) * 0.3;
     }
   }
   return {
@@ -503,8 +608,9 @@ function makeTextures() {
     nCast: normalFrom(mix, S, 3.2),
     nPoly: normalFrom(stipple, S, 5.5),
     nWood: normalFrom(woodH, S, 1.6),
-    woodBirch: wood([150, 66, 36]),
-    woodWalnut: wood([120, 70, 40])
+    // СВД: клеёная берёзовая фанера под красно-коричневым лаком
+    woodBirch: wood([104, 42, 24], { lines: 60, rings: 5, warp: 0.035, blot: 0.3 }),
+    woodWalnut: wood([104, 62, 38], { seed: 777, lines: 38, rings: 9, warp: 0.07 })
   };
 }
 function createMaterials(envMap) {
@@ -552,6 +658,8 @@ function createMaterials(envMap) {
   R4.spring = metal(4868942, 0.35, 0.9);
   R4.poly = poly(1776412, 0.74);
   R4.polySoft = poly(2105377, 0.86, { ns: 0.7 });
+  // текстура рукояти (Glock RTF / HK): мелкая «наждачка», заметнее обычного полимера
+  R4.polyGrip = poly(1250067, 0.84, { ns: 1.15, tile: 5, env: 0.6 });
   R4.polyFde = poly(9995359, 0.78);
   R4.polyFdeDark = poly(7299144, 0.8);
   R4.polyPlum = poly(4991522, 0.58, { ns: 0.3 });
@@ -569,7 +677,7 @@ function createMaterials(envMap) {
   R4.wood = phys({
     color: 16777215,
     map: rep(tex2.woodBirch, 160),
-    roughness: 0.52,
+    roughness: 0.46,
     metalness: 0,
     normalMap: rep(tex2.nWood, 160),
     normalScale: new THREE2.Vector2(0.25, 0.25),
@@ -656,6 +764,7 @@ __export(geo_exports, {
   flutesX: () => flutesX,
   latheX: () => latheX,
   loftX: () => loftX,
+  loftPath: () => loftPath,
   merge: () => merge,
   mirrorZ: () => mirrorZ,
   mlokHoles: () => mlokHoles,
@@ -1102,6 +1211,66 @@ function loftX(rings, o = {}) {
   }
   ng.setAttribute("uv", new THREE3.BufferAttribute(uv, 2));
   return toCreasedNormals(ng, (o.crease ?? 40) * D2R);
+}
+// Лофт по кривой оси в плоскости XY (рукояти, шейки прикладов). secs: [{c:[x,y], a, b, k?, f?, r?}]
+// a — полутолщина вдоль нормали к оси (спереди/сзади), b — полуширина по Z, f — смещение центра
+// сечения вдоль нормали (выемки под пальцы, горб), r — радиус-скругление передней грани (0…1: доля a).
+function loftPath(secs, o = {}) {
+  const n = o.seg ?? 36, m = secs.length;
+  const pos = [], idx = [];
+  const tan = (i) => {
+    const a = secs[Math.max(0, i - 1)].c, b = secs[Math.min(m - 1, i + 1)].c;
+    const dx = b[0] - a[0], dy = b[1] - a[1], l = Math.hypot(dx, dy) || 1;
+    return [dx / l, dy / l];
+  };
+  for (let i = 0; i < m; i++) {
+    const S2 = secs[i], [tx, ty] = tan(i), nx = -ty, ny = tx, k = S2.k ?? o.k ?? 3, kb = S2.kb ?? k;
+    for (let j = 0; j < n; j++) {
+      const t = j / n * Math.PI * 2, c = Math.cos(t), s2 = Math.sin(t);
+      // передняя (c>0) и задняя половины могут иметь разную толщину: a — вперёд, a2 — назад
+      const aa = c >= 0 ? S2.a : S2.a2 ?? S2.a;
+      const u = aa * Math.sign(c) * Math.pow(Math.abs(c), 2 / (c >= 0 ? k : kb)) + (S2.f || 0);
+      const w = S2.b * Math.sign(s2) * Math.pow(Math.abs(s2), 2 / k);
+      pos.push(S2.c[0] + nx * u, S2.c[1] + ny * u, w);
+    }
+  }
+  for (let i = 0; i < m - 1; i++) for (let j = 0; j < n; j++) {
+    const a = i * n + j, b = i * n + (j + 1) % n, c = (i + 1) * n + j, d = (i + 1) * n + (j + 1) % n;
+    idx.push(a, c, b, b, c, d);
+  }
+  const cap = (ri, flip) => {
+    const base = pos.length / 3;
+    let cx = 0, cy = 0;
+    for (let j = 0; j < n; j++) cx += pos[(ri * n + j) * 3] / n, cy += pos[(ri * n + j) * 3 + 1] / n;
+    pos.push(cx, cy, 0);
+    for (let j = 0; j < n; j++) {
+      const a = ri * n + j, b = ri * n + (j + 1) % n;
+      flip ? idx.push(base, a, b) : idx.push(base, b, a);
+    }
+  };
+  if (o.caps !== false) {
+    cap(0, false);
+    cap(m - 1, true);
+  }
+  const g = new THREE3.BufferGeometry();
+  g.setAttribute("position", new THREE3.Float32BufferAttribute(pos, 3));
+  g.setIndex(idx);
+  if (o.flip) {
+    const ix = g.index.array;
+    for (let i = 0; i < ix.length; i += 3) {
+      const t = ix[i + 1];
+      ix[i + 1] = ix[i + 2];
+      ix[i + 2] = t;
+    }
+  }
+  const ng = g.toNonIndexed();
+  const p = ng.attributes.position, uv = new Float32Array(p.count * 2);
+  for (let i = 0; i < p.count; i++) {
+    uv[i * 2] = p.getX(i) + p.getZ(i) * 0.3;
+    uv[i * 2 + 1] = p.getY(i) + p.getZ(i);
+  }
+  ng.setAttribute("uv", new THREE3.BufferAttribute(uv, 2));
+  return toCreasedNormals(ng, (o.crease ?? 60) * D2R);
 }
 function superEllipse(a, b, k = 3, n = 32, cy = 0, cz = 0) {
   const out = [];
@@ -1905,6 +2074,238 @@ var Foley = class {
   }
 };
 
+// src/engine/gunshot.js
+// Выстрел рендерится заранее в буфер (стерео, 3 варианта на конфигурацию) — так можно
+// позволить себе нормальную физику вместо пары фильтров на шуме:
+//   дульная волна — импульс Фридлендера (положительная фаза T+ растёт с зарядом и калибром),
+//   турбулентный выхлоп газов — шум с падающим срезом, «масса» — низкий удар, который ощущается телом,
+//   N-волна сверхзвуковой пули (у СВД — хлёсткий щелчок раньше хлопка), отражение от земли (≈7 мс),
+//   механика цикла своего семейства (кожух Glock, роликовый затвор MP5, газовый поршень СВД),
+//   эхо стрельбища: боковые валы, вал за мишенями, лесополоса; для крупных калибров — раскатистый хвост.
+// Глушитель: волна почти срезана и сдвинута вниз, «пфф» из торца, выхлоп из окна, механика слышна;
+// сверхзвуковая пуля СВД щёлкает и с глушителем.
+var SHOT = {
+  // T — положительная фаза волны (с); peak — уровень; thumpF/thumpT — низ; gas — длит. выхлопа (с), gasF — срез
+  glock: { T: 32e-5, peak: 0.95, thumpF: 150, thumpT: 0.022, thump: 0.55, gas: 0.016, gasF: 9500, gasLo: 1700, crack: 0, tail: 0.95, echo: 0.8, drive: 2.4, room: 0.9, bright: 1.25 },
+  mp5: { T: 42e-5, peak: 0.9, thumpF: 118, thumpT: 0.03, thump: 0.62, gas: 0.022, gasF: 8200, gasLo: 1400, crack: 0.12, tail: 1.15, echo: 0.9, drive: 2.2, room: 1, bright: 1.05 },
+  svd: { T: 95e-5, peak: 1.15, thumpF: 74, thumpT: 0.06, thump: 1, gas: 0.05, gasF: 6200, gasLo: 800, crack: 1, tail: 2.4, echo: 1.35, drive: 2.8, room: 1.3, bright: 0.95 },
+  m870: { T: 16e-4, peak: 1.25, thumpF: 52, thumpT: 0.1, thump: 1.35, gas: 0.075, gasF: 3600, gasLo: 420, crack: 0, tail: 2.7, echo: 1.45, drive: 3.2, room: 1.4, bright: 0.7 },
+  ak: { T: 7e-4, peak: 1.05, thumpF: 95, thumpT: 0.045, thump: 0.85, gas: 0.04, gasF: 6800, gasLo: 900, crack: 0.8, tail: 1.9, echo: 1.2, drive: 2.6, room: 1.2, bright: 1 }
+};
+var MUZ2 = {
+  bare: { blast: 1, gas: 1, lp: 1, thump: 1, echo: 1, harsh: 0 },
+  fh: { blast: 0.95, gas: 0.8, lp: 0.92, thump: 1, echo: 1, harsh: 0 },
+  choke: { blast: 1.02, gas: 1, lp: 1, thump: 1, echo: 1, harsh: 0 },
+  comp: { blast: 1.2, gas: 1.25, lp: 1.15, thump: 1.05, echo: 1.15, harsh: 0.35 },
+  brake: { blast: 1.4, gas: 1.5, lp: 1.2, thump: 1.1, echo: 1.3, harsh: 0.6 },
+  linear: { blast: 0.7, gas: 0.6, lp: 0.7, thump: 0.95, echo: 0.85, harsh: 0 },
+  supp: { blast: 0.09, gas: 0.12, lp: 0.16, thump: 0.3, echo: 0.22, harsh: 0 }
+};
+function seeded(seed) {
+  let s = seed >>> 0 || 1;
+  return () => (s = s * 1664525 + 1013904223 >>> 0) / 4294967296;
+}
+function hashStr(str) {
+  let h = 2166136261;
+  for (let i = 0; i < str.length; i++) h = Math.imul(h ^ str.charCodeAt(i), 16777619);
+  return h >>> 0;
+}
+// одно-полюсный ФНЧ по месту
+function lp1(d, sr, f, i0 = 0, i1 = d.length) {
+  const a = 1 - Math.exp(-2 * Math.PI * f / sr);
+  let y = 0;
+  for (let i = i0; i < i1; i++) d[i] = y += (d[i] - y) * a;
+  return d;
+}
+function renderGunshot(sr, fam, muzzle, cal, variant) {
+  const P = SHOT[fam] || SHOT.ak, M = MUZ2[muzzle] || MUZ2.bare;
+  const supp = muzzle === "supp";
+  const len = supp ? Math.max(0.9, P.tail * 0.45) : P.tail + 0.35;
+  const n = Math.ceil(sr * len);
+  const L = new Float32Array(n), Rt = new Float32Array(n);
+  const rnd = Math.random;
+  const v = 0.93 + rnd() * 0.14;
+  const t0 = Math.floor(sr * 3e-3);
+  // --- ядро (моно): волна + выхлоп + низ -----------------------------------
+  const coreN = Math.ceil(sr * 0.25);
+  const core = new Float32Array(coreN);
+  // импульс Фридлендера: p(t) = (1 - t/T)·e^(-b·t/T); у глушителя фаза длиннее и мягче
+  const T = P.T * (supp ? 3.2 : 1) * (0.95 + rnd() * 0.1), b = 1.7;
+  const blastA = P.peak * M.blast * v;
+  for (let i = 0; i < coreN; i++) {
+    const t = i / sr;
+    if (t > T * 6) break;
+    core[i] += blastA * (1 - t / T) * Math.exp(-b * t / T);
+  }
+  // турбулентный выхлоп: белый шум, срез падает от gasF к gasLo, огибающая ~ быстрый спад
+  {
+    const g = new Float32Array(coreN);
+    const dur = P.gas * (supp ? 0.7 : 1);
+    for (let i = 0; i < coreN; i++) {
+      const t = i / sr;
+      g[i] = (rnd() * 2 - 1) * Math.exp(-t / dur) * (1 - Math.exp(-t / 4e-4));
+    }
+    // ФНЧ с падающей частотой — кусками по 64 отсчёта
+    let y1 = 0, y2 = 0;
+    for (let i = 0; i < coreN; i++) {
+      const t = i / sr;
+      const f = P.gasLo * M.lp + (P.gasF * M.lp - P.gasLo * M.lp) * Math.exp(-t / (dur * 0.8));
+      const a = 1 - Math.exp(-2 * Math.PI * Math.min(f, sr * 0.45) / sr);
+      y1 += (g[i] - y1) * a;
+      y2 += (y1 - y2) * a;
+      core[i] += y2 * 0.9 * M.gas * v * (supp ? 1.6 : 1);
+    }
+  }
+  // «масса»: полтора периода низкой частоты с быстрым спадом и уходом частоты вниз
+  {
+    const f0 = P.thumpF * (0.95 + rnd() * 0.1);
+    let ph = 0;
+    for (let i = 0; i < coreN; i++) {
+      const t = i / sr;
+      if (t > P.thumpT * 6) break;
+      const f = f0 * (0.55 + 0.45 * Math.exp(-t / (P.thumpT * 0.7)));
+      ph += 2 * Math.PI * f / sr;
+      core[i] += Math.sin(ph) * P.thump * M.thump * v * Math.exp(-t / P.thumpT) * (1 - Math.exp(-t / 6e-4)) * 0.8;
+    }
+  }
+  // резкость дульных тормозов/компенсаторов: полоса 2–3 кГц
+  if (M.harsh > 0) {
+    const h = new Float32Array(coreN);
+    for (let i = 0; i < coreN; i++) h[i] = (rnd() * 2 - 1) * Math.exp(-i / sr / 0.03);
+    biquad(h, sr, "bp", 2600, 1.1);
+    for (let i = 0; i < coreN; i++) core[i] += h[i] * M.harsh * 1.4;
+  }
+  // глушитель: «пфф» из торца (узкая полоса ~900 Гц) + выхлоп из окна (3–6 кГц, чуть позже)
+  if (supp) {
+    const pf = new Float32Array(coreN), port = new Float32Array(coreN);
+    const pd = fam === "m870" || fam === "svd" ? 0.035 : 0.02;
+    for (let i = 0; i < coreN; i++) {
+      const t = i / sr;
+      pf[i] = (rnd() * 2 - 1) * Math.exp(-t / pd) * (1 - Math.exp(-t / 1.5e-3));
+      const tp = t - (fam === "glock" ? 4e-3 : 7e-3);
+      port[i] = tp > 0 ? (rnd() * 2 - 1) * Math.exp(-tp / 0.012) : 0;
+    }
+    biquad(pf, sr, "bp", fam === "m870" ? 520 : fam === "svd" ? 700 : 950, 1.3);
+    biquad(port, sr, "bp", 4200, 1.2);
+    const first = variant === 0 ? 1.8 : 1;
+    for (let i = 0; i < coreN; i++) core[i] += pf[i] * 1.5 * v * first + port[i] * (fam === "svd" ? 0.35 : 0.22);
+  }
+  // яркость: подъём верхов у пистолета (короткий ствол «хлещет»), завал у ружья
+  {
+    const hp = core.slice();
+    biquad(hp, sr, "hp", 2500, 0.7);
+    for (let i = 0; i < coreN; i++) core[i] += hp[i] * (P.bright - 1) * 1.2;
+  }
+  // насыщение: без него выстрел звучит как «хлопушка» — любой реальный записанный выстрел перегружен
+  {
+    const dr = P.drive * (supp ? 0.55 : 1);
+    const nrm = Math.tanh(dr);
+    for (let i = 0; i < coreN; i++) core[i] = Math.tanh(core[i] * dr) / nrm;
+  }
+  // --- сборка: прямой звук + отражение от земли/площадки ---------------------
+  const put = (src, at, g, gl = 1, gr = 1) => {
+    const i0 = Math.floor(at * sr);
+    for (let i = 0; i < src.length && i0 + i < n; i++) {
+      L[i0 + i] += src[i] * g * gl;
+      Rt[i0 + i] += src[i] * g * gr;
+    }
+  };
+  put(core, t0 / sr, 1, 1, 0.94);
+  {
+    const gnd = core.slice();
+    lp1(gnd, sr, 3200);
+    put(gnd, t0 / sr + 72e-4, 0.42, 0.95, 1);
+  }
+  // N-волна пули: перед хлопком (пуля обгоняет звук), двуполярный импульс ~0,5 мс
+  if (P.crack > 0) {
+    const cn = Math.ceil(sr * 25e-4), cr = new Float32Array(cn);
+    const w = Math.floor(sr * 5e-4);
+    for (let i = 0; i < cn; i++) cr[i] = i < w ? 1 - 2 * i / w : i < w + 3 ? -1 + (i - w) / 3 : 0;
+    const ringN = Math.ceil(sr * 0.02), ring = new Float32Array(ringN);
+    for (let i = 0; i < ringN; i++) ring[i] = (rnd() * 2 - 1) * Math.exp(-i / sr / 3e-3);
+    biquad(ring, sr, "hp", 3500, 0.7);
+    const ca = P.crack * (supp ? 0.85 : 0.75) * v;
+    put(cr, (t0 - Math.floor(sr * 6e-4)) / sr, ca, 1, 0.9);
+    put(ring, t0 / sr, ca * 0.25, 0.8, 1);
+  }
+  // --- механика цикла: моды фиксированы для семейства (seeded), это «голос» оружия ---------
+  if (fam !== "m870") {
+    const Tm = new Track(sr, 0.2);
+    const saveR = R;
+    R = seeded(hashStr("mech|" + fam));
+    const cyc = fam === "glock" ? 0.05 : fam === "mp5" ? 0.075 : fam === "svd" ? 0.12 : 0.085;
+    if (fam === "glock") {
+      Tm.metal(0.2 * cyc, 0.42, 1800, 7200, 3e-3, { n: 20, tick: 0.5 });
+      Tm.thud(0.2 * cyc, 0.25, 1100, 0.01, 260);
+      Tm.metal(0.78 * cyc, 0.5, 1300, 6200, 4e-3, { n: 22, tick: 0.6 });
+    } else if (fam === "mp5") {
+      Tm.metal(0.25 * cyc, 0.35, 900, 5200, 5e-3, { n: 22, tick: 0.4 });
+      Tm.metal(0.82 * cyc, 0.6, 700, 4600, 6e-3, { n: 26, tick: 0.6 });
+      Tm.spring(0.3 * cyc, 0.05, 0.06, 2400);
+    } else {
+      Tm.noise(0.08 * cyc, 0.25, 0.01, { bp: 2200, q: 1.2 });
+      Tm.metal(0.35 * cyc, 0.45, 600, 4200, 7e-3, { n: 26, tick: 0.4 });
+      Tm.metal(0.88 * cyc, 0.75, 480, 3600, 9e-3, { n: 30, tick: 0.6 });
+      Tm.thud(0.88 * cyc, 0.3, 500, 0.02, 120);
+    }
+    R = saveR;
+    const mg = (supp ? 0.55 : 0.28) * (fam === "svd" ? 1.2 : 1);
+    put(Tm.d, t0 / sr + 2e-3, mg, 0.85, 1);
+  }
+  // --- окружение ------------------------------------------------------------
+  // раннее: скамья/площадка стрелка (плотные короткие отражения 3–25 мс)
+  const echoSrc = core.slice(0, Math.ceil(sr * 0.09));
+  lp1(echoSrc, sr, 2400);
+  for (let i = 0, m = echoSrc.length, f = Math.floor(sr * 0.05); i < f; i++) echoSrc[m - 1 - i] *= 0.5 - 0.5 * Math.cos(Math.PI * i / f);
+  const E = M.echo * P.echo * (supp ? 1.4 : 1);
+  for (let i = 0; i < 6; i++) put(echoSrc, t0 / sr + 0.003 + rnd() * 0.022, 0.035 * P.room * E, 0.5 + rnd() * 0.5, 0.5 + rnd() * 0.5);
+  // дальние: боковые валы (42 м), вал за мишенями (~128 м), лесополоса (150–190 м)
+  const refl = [[0.245, 0.2, 1500, 1, 0.55], [0.262, 0.16, 1400, 0.5, 1], [0.75, 0.22, 900, 0.8, 0.8], [0.9, 0.1, 700, 1, 0.6], [1.04, 0.09, 600, 0.6, 1], [1.21, 0.05, 500, 0.9, 0.8]];
+  for (const [dt, g, f, gl, gr] of refl) {
+    if (dt > len - 0.2) continue;
+    const e = echoSrc.slice();
+    lp1(e, sr, f);
+    lp1(e, sr, f * 1.5);
+    // размазывание: несколько копий с разбросом — отражение от неровного вала, а не от стены
+    for (let k = 0; k < 4; k++) put(e, t0 / sr + dt + rnd() * 0.035, g * E * (0.14 + rnd() * 0.1), gl, gr);
+  }
+  // диффузный хвост: шум по трём полосам, верха гаснут быстрее (поглощение воздухом)
+  {
+    const tl = P.tail * (supp ? 0.35 : 1);
+    const bands = [[260, tl * 0.5, 0.9], [1100, tl * 0.32, 0.55], [3800, tl * 0.14, 0.3]];
+    for (const ch of [L, Rt]) {
+      for (const [f, T60, a] of bands) {
+        const tn = Math.min(n, Math.ceil(sr * T60 * 1.6));
+        const d = new Float32Array(tn);
+        for (let i = 0; i < tn; i++) {
+          const t = i / sr;
+          d[i] = (rnd() * 2 - 1) * Math.exp(-6.9 * t / T60) * Math.min(1, t / 0.035);
+        }
+        biquad(d, sr, "bp", f, 0.8);
+        // раскаты у крупных калибров: медленная модуляция низкой полосы
+        if (f < 400 && P.tail > 2) for (let i = 0; i < tn; i++) d[i] *= 0.6 + 0.4 * Math.sin(i / sr * 7.3 + 1.3) * Math.sin(i / sr * 2.1);
+        const g = a * 0.22 * E * P.peak;
+        const i0 = t0 + Math.floor(sr * 0.012);
+        for (let i = 0; i < tn && i0 + i < n; i++) ch[i0 + i] += d[i] * g;
+      }
+    }
+  }
+  // нормировка по пику + мягкий срез конца
+  let pk = 0;
+  for (let i = 0; i < n; i++) pk = Math.max(pk, Math.abs(L[i]), Math.abs(Rt[i]));
+  const gN = 0.97 / Math.max(1e-6, pk);
+  const fade = Math.floor(sr * 0.08);
+  for (let i = 0; i < n; i++) {
+    const f = i > n - fade ? (n - i) / fade : 1;
+    L[i] *= gN * f;
+    Rt[i] *= gN * f;
+  }
+  return [L, Rt];
+}
+// Громкость на выходе (после нормировки буферов) — соотношение калибров как у стрелка.
+var SHOT_LEVEL = { glock: 0.8, mp5: 0.84, svd: 1, m870: 1, ak: 0.95 };
+var SUPP_LEVEL = { glock: 0.32, mp5: 0.3, svd: 0.62, m870: 0.42, ak: 0.45 };
+
 // src/engine/audio.js
 // Выстрел: дульная волна (полосовой шум с падающим срезом), удар давления (низкий импульс),
 // N-волна сверхзвуковой пули, механика цикла (буфер foley), эхо стрельбища.
@@ -2103,120 +2504,62 @@ var GunAudio = class {
   shot(o = {}) {
     if (!this.ctx || this.muted) return;
     const c = this.ctx, t = c.currentTime + 5e-3;
-    const P = this.params();
+    const fam = this.shotFamily();
     const supp = this.muzzle === "supp";
-    const M2 = MUZ[this.muzzle] || MUZ.fh;
-    const v = 0.92 + Math.random() * 0.16;
-    // первый выстрел через холодный глушитель громче: кислород в камерах догорает
-    const frp = supp && t - this.lastShot > 3 ? 1.9 : 1;
+    // холодный глушитель: первый выстрел громче (кислород в камерах догорает)
+    const cold = supp && t - this.lastShot > 3;
     this.lastShot = t;
-    const L = P.level * v * (o.gain ?? 1);
-    {
-      const s = this.src(this.noise, t, 0.6, 0.9 + Math.random() * 0.2);
-      const lp = c.createBiquadFilter();
-      lp.type = "lowpass";
-      lp.frequency.setValueAtTime(P.blastF * M2.lp * (0.9 + Math.random() * 0.2), t);
-      lp.frequency.exponentialRampToValueAtTime(Math.max(300, P.blastF * M2.lp * 0.18), t + P.blastT * 2.5);
-      const hp = c.createBiquadFilter();
-      hp.type = "highpass";
-      hp.frequency.value = supp ? 90 : 55;
-      const g = c.createGain();
-      this.env(g, t, M2.attack, 1.25 * L * M2.blast * frp, P.blastT * M2.tail, 0.7);
-      s.connect(lp).connect(hp).connect(g);
-      this.out(g, 0.9 * M2.wet);
-    }
-    const harsh = M2.harsh + (P.harsh || 0);
-    if (harsh > 0 && !supp) {
-      const s = this.src(this.noise, t, 0.25);
-      const bp = c.createBiquadFilter();
-      bp.type = "bandpass";
-      bp.frequency.value = 2600;
-      bp.Q.value = 1.2;
-      const g = c.createGain();
-      this.env(g, t, 4e-4, 0.9 * L * harsh, 0.035, 0.3);
-      s.connect(bp).connect(g);
-      this.out(g, 0.6 * M2.wet);
-    }
-    {
-      // удар давления: полпериода-период низкой частоты с быстрым спадом (не тон)
-      const osc = c.createOscillator();
-      osc.type = "sine";
-      const f = P.bodyF * (supp ? 0.8 : 1) * (0.95 + Math.random() * 0.1);
-      osc.frequency.setValueAtTime(f, t);
-      osc.frequency.exponentialRampToValueAtTime(f * 0.33, t + P.bodyT);
-      const g = c.createGain();
-      this.env(g, t, 2e-3, 1.1 * L * P.body * M2.body * frp, P.bodyT * 0.5, P.bodyT * 3);
-      const ws = c.createWaveShaper();
-      ws.curve = this.softclip || (this.softclip = (() => {
-        const a = new Float32Array(256);
-        for (let i = 0; i < 256; i++) a[i] = Math.tanh((i / 128 - 1) * 2.2);
-        return a;
-      })());
-      osc.connect(ws).connect(g);
-      this.out(g, 0.35 * M2.wet);
-      osc.start(t);
-      osc.stop(t + P.bodyT * 3 + 0.05);
-      const s = this.src(this.pink, t, 0.3);
-      const lp = c.createBiquadFilter();
-      lp.type = "lowpass";
-      lp.frequency.value = supp ? 380 : 700;
-      const g2 = c.createGain();
-      this.env(g2, t, 1e-3, 1.6 * L * P.body * M2.body * frp, P.bodyT * 0.7, 0.35);
-      s.connect(lp).connect(g2);
-      this.out(g2, 0.5 * M2.wet);
-    }
-    // с глушителем 9 мм стреляют дозвуковыми — щелчка пули нет
-    const crack = supp && P.subSupp ? 0 : P.crack * M2.crack;
-    if (crack > 0) {
-      const s = c.createBufferSource();
-      s.buffer = this.crackBuf;
-      const hp = c.createBiquadFilter();
-      hp.type = "highpass";
-      hp.frequency.value = 1800;
-      const g = c.createGain();
-      g.gain.value = 0.55 * crack * v;
-      s.connect(hp).connect(g);
-      this.out(g, 0.25);
-      s.start(t + 2e-3);
-    }
-    if (supp) {
-      // выхлоп газа из окна/казённика и «пфф» из торца глушителя
-      const s = this.src(this.noise, t, 0.2);
-      const bp = c.createBiquadFilter();
-      bp.type = "bandpass";
-      bp.frequency.value = 1400;
-      bp.Q.value = 0.8;
-      const g = c.createGain();
-      this.env(g, t + 2e-3, 3e-3, 0.22 * L, 0.03, 0.2);
-      s.connect(bp).connect(g);
-      this.out(g, 0.1);
-    }
-    {
-      const mech = (this.profile.mech ?? 0.8) * (supp ? 1.3 : 1);
-      const P2 = this.profile;
-      if (P2.family !== "m870") {
-        const s = c.createBufferSource();
-        s.buffer = this.foley.buffer("cycle", { fam: P2.family, rpm: P2.rpm });
-        const g = c.createGain();
-        g.gain.value = 0.55 * mech;
-        s.connect(g);
-        this.out(g, 0.05, 0.12);
-        s.start(t + 1e-3);
+    const buf = this.shotBuffer(fam, this.muzzle, cold);
+    const s = c.createBufferSource();
+    s.buffer = buf;
+    s.playbackRate.value = 0.975 + Math.random() * 0.05;
+    const g = c.createGain();
+    g.gain.value = (supp ? SUPP_LEVEL[fam] ?? 0.4 : SHOT_LEVEL[fam] ?? 0.9) * (o.gain ?? 1) * 1.15;
+    s.connect(g).connect(this.dry);
+    s.start(t);
+  }
+  shotFamily() {
+    const f = this.profile.family;
+    return SHOT[f] ? f : this.profile.cal === "12ga" ? "m870" : this.profile.cal === "9x19" ? "mp5" : this.profile.cal === "762x54R" ? "svd" : "ak";
+  }
+  // Буферы выстрела: 3 варианта на (оружие, дульное устройство); вариант 0 у глушителя — «холодный».
+  shotBuffer(fam, muzzle, cold) {
+    this.shots = this.shots || new Map();
+    const key = fam + "|" + muzzle;
+    let list = this.shots.get(key);
+    if (!list) {
+      list = [];
+      const sr = this.ctx.sampleRate;
+      for (let v = 0; v < 3; v++) {
+        const [l, r] = renderGunshot(sr, fam, muzzle, this.profile.cal, v);
+        const b = this.ctx.createBuffer(2, l.length, sr);
+        b.getChannelData(0).set(l);
+        b.getChannelData(1).set(r);
+        list.push(b);
       }
+      this.shots.set(key, list);
     }
-    if (!supp) {
-      // эхо от вала и от лесополосы
-      for (const [dt, a, f] of [[0.34, 0.14, 900], [0.92, 0.06, 600]]) {
-        const s = this.src(this.pink, t + dt, 0.3);
-        const lp = c.createBiquadFilter();
-        lp.type = "lowpass";
-        lp.frequency.value = f;
-        const g = c.createGain();
-        this.env(g, t + dt, 0.01, a * L * M2.wet * (0.6 + P.body * 0.4), 0.09 + P.blastT * 0.4, 0.34);
-        s.connect(lp).connect(g);
-        this.out(g, 0.6, -0.2);
-      }
-    }
+    if (muzzle === "supp") return cold ? list[0] : list[1 + (Math.random() * 2 | 0)];
+    return list[Math.random() * list.length | 0];
+  }
+  // Кнопка фонаря на торце: резиновый колпачок — глухой «тык» и щелчок микропереключателя.
+  tailcap(on) {
+    if (!this.ctx || this.muted) return;
+    const t = this.ctx.currentTime;
+    this.thud(t, 1800, 0.12, 0.012, 0);
+    this.clank(t + 4e-3, on ? 5200 : 4600, 0.1, 8e-3, 4, 0.1, 0.02);
+  }
+  // Замена батарей: отвернуть крышку, вытряхнуть CR123, вставить, завернуть.
+  batteryChange() {
+    if (!this.ctx || this.muted) return;
+    const t = this.ctx.currentTime;
+    for (let i = 0; i < 5; i++) this.slide(t + i * 0.07, 2600, 3400, 0.05, 0.05, 0.05);
+    this.clank(t + 0.42, 3200, 0.12, 0.02, 3, 0.2);
+    this.clank(t + 0.47, 2900, 0.1, 0.02, 3, 0.25);
+    this.thud(t + 0.8, 1500, 0.15, 0.02, 0);
+    this.thud(t + 0.9, 1500, 0.15, 0.02, 0);
+    for (let i = 0; i < 5; i++) this.slide(t + 1.05 + i * 0.07, 3400, 2600, 0.05, 0.05, 0.05);
+    this.clank(t + 1.45, 4200, 0.12, 0.012, 4, 0);
   }
   play(name, o = {}) {
     if (!this.ctx || this.muted) return;
@@ -2285,6 +2628,7 @@ var GunAudio = class {
     for (const n of ["dryFire", "selector", "click", "hkLock", "boltSlam"]) this.foley.buffer(n, o);
     for (const kind of ["brass", "steel", "hull"]) this.foley.buffer("casing", { ...o, kind });
     this.foley.buffer("cycle", { fam: P.family, rpm: P.rpm });
+    this.shotBuffer(this.shotFamily(), this.muzzle || "bare");
   }
   // Установка модуля: щелчки прижима или храповик резьбы.
   attach(kind) {
@@ -2601,6 +2945,172 @@ var Particles = class {
     }
   }
 };
+// Цветовая температура светодиода → линейный RGB (приближение Таннера Хелланда).
+function kelvinColor(k) {
+  const t = k / 100;
+  let r, g, b;
+  if (t <= 66) {
+    r = 255;
+    g = 99.47 * Math.log(t) - 161.12;
+    b = t <= 19 ? 0 : 138.52 * Math.log(t - 10) - 305.04;
+  } else {
+    r = 329.7 * Math.pow(t - 60, -0.1332);
+    g = 288.12 * Math.pow(t - 60, -0.0755);
+    b = 255;
+  }
+  const c = (v) => Math.min(255, Math.max(0, v)) / 255;
+  return new THREE6.Color().setRGB(c(r), c(g), c(b), THREE6.SRGBColorSpace);
+}
+// Световое пятно отражателя: горячее ядро, тёмное «кольцо» перехода, широкая засветка и
+// слабое внешнее гало от кромки отражателя. Небольшая неровность — след апельсиновой корки.
+function torchCookie(hot, spill) {
+  const S2 = 256, c = document.createElement("canvas");
+  c.width = c.height = S2;
+  const g = c.getContext("2d"), img = g.createImageData(S2, S2);
+  for (let y = 0; y < S2; y++) for (let x = 0; x < S2; x++) {
+    const dx = (x + 0.5) / S2 * 2 - 1, dy = (y + 0.5) / S2 * 2 - 1, r = Math.hypot(dx, dy);
+    const a = Math.atan2(dy, dx);
+    const core = Math.exp(-Math.pow(r / hot, 2.2));
+    const ring = 0.06 * Math.exp(-Math.pow((r - hot * 1.9) / (hot * 0.45), 2));
+    const sp = spill * Math.pow(Math.max(0, 1 - r), 1.4) * (1 - 0.35 * Math.exp(-Math.pow((r - hot * 1.35) / (hot * 0.3), 2)));
+    const halo = 0.005 * Math.exp(-Math.pow((r - 0.86) / 0.08, 2));
+    const orange = 1 + 0.035 * Math.sin(a * 23 + r * 40) * Math.sin(a * 7 - r * 25);
+    const v = Math.min(1, (core + ring + sp + halo) * orange) * (r < 1 ? 1 : 0);
+    const q = Math.pow(v, 1 / 2.2) * 255;
+    const i = (y * S2 + x) * 4;
+    img.data[i] = img.data[i + 1] = img.data[i + 2] = q;
+    img.data[i + 3] = 255;
+  }
+  g.putImageData(img, 0, 0);
+  const t = new THREE6.CanvasTexture(c);
+  t.colorSpace = THREE6.SRGBColorSpace;
+  return t;
+}
+var BEAM_VS = `
+varying vec3 vW;
+void main(){
+  vec4 w = modelMatrix * vec4(position, 1.);
+  vW = w.xyz;
+  gl_Position = projectionMatrix * viewMatrix * w;
+}`;
+// Объёмный луч: по лучу зрения от камеры до задней грани конуса — 28 шагов; в каждой точке
+// рассеяние ∝ I(θ)/t² (профиль пятна как у куки-текстуры). Земля перекрывает луч.
+// Пыль/влага — медленный шум в мировых координатах, чтобы луч «жил».
+var BEAM_FS = `
+uniform vec3 color; uniform float k; uniform float len; uniform float tanA; uniform float hot; uniform float spill;
+uniform float time; uniform vec3 camPos; uniform vec3 O; uniform vec3 D;
+varying vec3 vW;
+float h(vec3 p){ return fract(sin(dot(p, vec3(12.9898,78.233,45.164))) * 43758.5453); }
+float n3(vec3 p){ vec3 i = floor(p), f = fract(p); f = f*f*(3.-2.*f);
+  return mix(mix(mix(h(i), h(i+vec3(1,0,0)), f.x), mix(h(i+vec3(0,1,0)), h(i+vec3(1,1,0)), f.x), f.y),
+             mix(mix(h(i+vec3(0,0,1)), h(i+vec3(1,0,1)), f.x), mix(h(i+vec3(0,1,1)), h(i+vec3(1,1,1)), f.x), f.y), f.z); }
+float groundAt(vec3 p){ return (abs(p.x + .8) < 3. && abs(p.z) < 2.5) ? .12 : 0.; }
+void main(){
+  vec3 rd = vW - camPos; float L = length(rd); rd /= L;
+  float t0 = dot(camPos - O, D), dd = dot(rd, D);
+  float s0 = 0., s1 = L;
+  if (abs(dd) > 1e-4) {
+    float a = (0.02 - t0) / dd, b = (len - t0) / dd;
+    s0 = max(s0, min(a, b)); s1 = min(s1, max(a, b));
+  }
+  if (s1 <= s0) discard;
+  const int N = 28;
+  float ds = (s1 - s0) / float(N);
+  float j = h(vec3(gl_FragCoord.xy, time));
+  float acc = 0.;
+  for (int i = 0; i < N; i++) {
+    vec3 p = camPos + rd * (s0 + (float(i) + j) * ds);
+    if (p.y < groundAt(p)) break;
+    vec3 v = p - O; float t = dot(v, D);
+    if (t <= 0.) continue;
+    float r = length(v - D * t) / (t * tanA);
+    if (r >= 1.) continue;
+    float prof = exp(-pow(r / hot, 2.2)) + spill * pow(1. - r, 1.4);
+    float tt = max(t, .25);
+    float dust = .6 + .55 * n3(p * 1.7 + vec3(time * .05, time * .015, time * .03)) + .3 * n3(p * 7.3 - time * .08);
+    acc += prof / (tt * tt) * dust * ds;
+  }
+  float nearCam = smoothstep(.02, .35, distance(vW, camPos));
+  float a = k * acc;
+  a = a / (1. + a * .6);
+  gl_FragColor = vec4(color * a * nearCam, 1.);
+}`;
+var Torch = class {
+  constructor(scene, T2) {
+    this.spot = new THREE6.SpotLight(16777215, 0, 140, 0.62, 0, 2);
+    this.spot.castShadow = true;
+    this.spot.shadow.mapSize.set(1024, 1024);
+    this.spot.shadow.camera.near = 0.03;
+    this.spot.shadow.camera.far = 140;
+    this.spot.shadow.bias = -2e-4;
+    this.spot.shadow.normalBias = 0.02;
+    this.spot.visible = false;
+    scene.add(this.spot, this.spot.target);
+    this.cookies = new Map();
+    const geo = new THREE6.ConeGeometry(1, 1, 48, 1, true);
+    geo.translate(0, -0.5, 0);
+    geo.rotateZ(Math.PI / 2);
+    this.beamU = { color: { value: new THREE6.Color() }, k: { value: 0 }, len: { value: 40 }, tanA: { value: 0.3 }, hot: { value: 0.3 }, spill: { value: 0.1 }, time: { value: 0 }, camPos: { value: new THREE6.Vector3() }, O: { value: new THREE6.Vector3() }, D: { value: new THREE6.Vector3(1, 0, 0) } };
+    this.beam = new THREE6.Mesh(geo, new THREE6.ShaderMaterial({ uniforms: this.beamU, vertexShader: BEAM_VS, fragmentShader: BEAM_FS, transparent: true, depthWrite: false, blending: THREE6.AdditiveBlending, side: THREE6.BackSide, toneMapped: false, fog: false }));
+    this.beam.frustumCulled = false;
+    this.beam.visible = false;
+    this.beam.renderOrder = 5;
+    scene.add(this.beam);
+    this.glare = new THREE6.Sprite(additive(T2.glow, 16777215, 0));
+    this.glare.visible = false;
+    this.glare.renderOrder = 6;
+    scene.add(this.glare);
+    this.t = 0;
+    this._v = new THREE6.Vector3();
+  }
+  cookie(spec) {
+    const key = spec.hot.toFixed(3) + "|" + spec.spill.toFixed(3);
+    if (!this.cookies.has(key)) this.cookies.set(key, torchCookie(spec.hot, spec.spill));
+    return this.cookies.get(key);
+  }
+  set(on, pos, dir, spec, level, haze, cam) {
+    this.spot.visible = this.beam.visible = this.glare.visible = !!on;
+    if (!on) {
+      this.spot.intensity = 0;
+      return;
+    }
+    const sp = this.spot, a = spec.angle ?? 0.62;
+    if (sp.userData.key !== spec.key) {
+      sp.userData.key = spec.key;
+      sp.map = this.cookie(spec);
+      sp.angle = a;
+      sp.color.copy(kelvinColor(spec.kelvin));
+      this.beamU.color.value.copy(sp.color);
+      this.beamU.tanA.value = Math.tan(a);
+      this.beamU.hot.value = spec.hot;
+      this.beamU.spill.value = spec.spill;
+      this.beamU.len.value = spec.throw;
+      this.beam.scale.set(spec.throw, Math.tan(a) * spec.throw, Math.tan(a) * spec.throw);
+    }
+    // сила света в канделах → единицы сцены (солнце днём ≈2.4)
+    sp.intensity = spec.cd * 0.022 * level;
+    sp.position.copy(pos);
+    sp.target.position.copy(pos).addScaledVector(dir, 10);
+    this.beam.position.copy(pos);
+    this.beam.quaternion.setFromUnitVectors(X_AXIS, dir);
+    this.t += 0.016;
+    this.beamU.time.value = this.t;
+    this.beamU.O.value.copy(pos);
+    this.beamU.D.value.copy(dir);
+    this.beamU.k.value = 1.1e-3 * spec.cd * 0.022 * haze * level;
+    if (cam) this.beamU.camPos.value.copy(cam.position);
+    // блик линзы: виден, когда смотришь в фонарь
+    this.glare.position.copy(pos).addScaledVector(dir, 2e-3);
+    let facing = 0;
+    if (cam) {
+      this._v.copy(cam.position).sub(pos).normalize();
+      facing = Math.max(0, this._v.dot(dir));
+    }
+    const g = Math.pow(facing, 6) * level;
+    this.glare.material.opacity = Math.min(1, 0.25 * level + g * 1.2);
+    this.glare.scale.setScalar(spec.lensR * 2.4 + g * 0.35 * Math.sqrt(spec.cd / 2e4));
+  }
+};
 var MAX_SHELLS = 60;
 var X_AXIS = new THREE6.Vector3(1, 0, 0);
 var FX = class {
@@ -2640,11 +3150,7 @@ var FX = class {
     this.dot = new THREE6.Sprite(additive(T2.glow, 16724e3, 1));
     this.dot.visible = false;
     scene.add(this.beam, this.dot);
-    this.spot = new THREE6.SpotLight(16773596, 0, 60, 0.28, 0.55, 1.4);
-    scene.add(this.spot, this.spot.target);
-    this.lampGlow = new THREE6.Sprite(additive(T2.glow, 16774886, 0));
-    this.lampGlow.scale.setScalar(0.07);
-    scene.add(this.lampGlow);
+    this.torch = new Torch(scene, T2);
     this.ray = new THREE6.Raycaster();
     this._v = new THREE6.Vector3();
     this._q = new THREE6.Quaternion();
@@ -2827,9 +3333,14 @@ var FX = class {
       }
     }
   }
-  setLaser(on, pos, dir, hitables) {
+  setLaser(on, pos, dir, hitables, color = 16722458) {
     this.beam.visible = this.dot.visible = on;
     if (!on) return;
+    if (this.laserColor !== color) {
+      this.laserColor = color;
+      this.beam.material.color.setHex(color);
+      this.dot.material.color.setHex(color);
+    }
     this.ray.set(pos, dir);
     this.ray.far = 250;
     const h = this.ray.intersectObjects(hitables, false)[0];
@@ -2838,15 +3349,17 @@ var FX = class {
     this.beam.scale.set(d, 1, 1);
     this.beam.quaternion.setFromUnitVectors(X_AXIS, dir);
     this.dot.position.copy(pos).addScaledVector(dir, d - 0.01);
-    this.dot.scale.setScalar(0.015 + d * 22e-4);
+    this.dot.scale.setScalar((0.015 + d * 22e-4) * (this.dotK || 1));
   }
-  setLight(on, pos, dir, lumens = 1e3) {
-    this.spot.intensity = on ? 30 * (lumens / 1e3) : 0;
-    this.lampGlow.material.opacity = on ? 0.9 : 0;
-    if (!on) return;
-    this.spot.position.copy(pos);
-    this.spot.target.position.copy(pos).addScaledVector(dir, 10);
-    this.lampGlow.position.copy(pos).addScaledVector(dir, 4e-3);
+  // spec: {cd, spill, hot, kelvin, lens}; level — отдача с учётом батареи (0…1); haze — видимость луча
+  setLight(on, pos, dir, spec, level = 1, haze = 1, cam) {
+    this.torch.set(on && level > 0, pos, dir, spec, level, haze, cam);
+  }
+  setLaserLevel(level, haze) {
+    const k = Math.max(0, level);
+    this.beam.material.opacity = (0.05 + 0.3 * haze) * k;
+    this.dot.material.opacity = Math.min(1, 0.25 + k);
+    this.dotK = 0.6 + 0.8 * haze;
   }
   // muzzle — текущий дульный срез: от нагретого ствола после очереди идёт струйка дыма
   update(dt, onShellBounce, cam, muzzle) {
@@ -3230,7 +3743,7 @@ var UI = class {
       <div><kbd>Пробел</kbd>огонь (в прицеле — ЛКМ)</div><div><kbd>ПКМ</kbd><kbd>F</kbd>прицелиться</div>
       <div><kbd>R</kbd>перезарядка</div><div><kbd>X</kbd>режим огня</div><div><kbd>V</kbd>сменить прицел</div>
       <div><kbd>N</kbd>откинуть увеличитель</div><div><kbd>Колесо</kbd>кратность / зум</div>
-      <div><kbd>C</kbd>фонарь</div><div><kbd>Z</kbd>ЛЦУ</div><div><kbd>B</kbd>сошки</div><div><kbd>K</kbd>приклад</div>
+      <div><kbd>C</kbd>фонарь</div><div><kbd>Z</kbd>ЛЦУ</div><div><kbd>U</kbd>заменить батареи</div><div><kbd>L</kbd>день / сумерки / ночь</div><div><kbd>B</kbd>сошки</div><div><kbd>K</kbd>приклад</div>
       <div><kbd>T</kbd>${esc(d.chargeLabel || "затвор")}</div>${d.feed === "tube" ? "" : "<div><kbd>M</kbd>магазин</div>"}<div><kbd>H</kbd>эта подсказка</div>
       <div class="h-n">Клик по детали — открыть её слот. Перетаскивание — вращение, колесо — масштаб.</div>`);
     this.helpBtn = el("button", "btn help-btn", "?");
@@ -3279,6 +3792,8 @@ var UI = class {
       laser: b("laser", "ЛЦУ", a.toggleLaser),
       bipod: b("bipod", "Сошки", a.toggleBipod),
       fold: b("fold", "Приклад", a.toggleFold),
+      batt: b("batt", "Батареи", a.replaceBatteries),
+      time: b("time", "День", a.cycleTime),
       sound: b("sound", "Звук", a.toggleSound, "icon")
     };
   }
@@ -3417,6 +3932,8 @@ var UI = class {
       st.magAside,
       st.light,
       st.laser,
+      a.time,
+      a.battInfo().map((b) => b.pct + (b.on ? "*" : "")).join(","),
       st.bipod,
       st.folded,
       a.audio.muted,
@@ -3433,8 +3950,12 @@ var UI = class {
     this.ammo.className = "panel ammo" + (low ? " low" : "");
     this.ammo.innerHTML = `<div class="a-n">${st.magIn ? n : "—"}${st.chambered ? "<sup>+1</sup>" : ""}<small>/${st.cap}</small></div>
       <div class="a-m"><b>${MODE[st.mode]}</b><span>${st.busy ? a.def.feed === "tube" ? "заряжание…" : "перезарядка…" : !st.magIn ? "нет магазина" : st.spent ? "передёрнуть цевьё" : !st.chambered ? "патронник пуст" : st.holdOpen ? a.def.id === "glock18c" ? "кожух на задержке" : "затвор на задержке" : st.handleLocked ? "рукоять в вырезе" : "готов"}</span></div>`;
+    const bi = a.battInfo();
+    if (bi.length) this.ammo.innerHTML += `<div class="a-batt">${bi.map((b) => `<div class="bt${b.on ? " on" : ""}${b.pct <= 15 ? " low" : ""}" title="${b.min} мин на полной мощности"><span>${b.label}</span><i><em style="width:${b.pct}%"></em></i><b>${b.pct}%</b></div>`).join("")}</div>`;
     const B = this.btn;
     B.mode.textContent = MODE[st.mode];
+    B.time.textContent = a.timeLabel();
+    B.batt.hidden = !bi.length || bi.every((b) => b.pct >= 100);
     B.ads.classList.toggle("on", st.ads);
     const multi = a.sights.length > 1;
     B.sight.hidden = !multi;
@@ -3598,6 +4119,7 @@ async function boot(def, lib) {
     zoom: 1,
     light: false,
     laser: false,
+    batt: {},
     folded: false,
     bipod: false,
     magAside: false,
@@ -3640,9 +4162,9 @@ async function boot(def, lib) {
     poseSelector(true);
     const mz = asm.info("muzzle")?.muzzle;
     audio.muzzle = mz ? mz.kind : "bare";
+    if (audio.ctx) (window.requestIdleCallback || setTimeout)(() => audio.shotBuffer(audio.shotFamily(), audio.muzzle));
     st.stats = asm.stats();
-    for (const it of asm.installed.values()) {
-      const s = it.info?.sight;
+    for (const it of asm.installed.values()) for (const s of [it.info?.sight, ...it.info?.alt || []]) {
       if (!s || !s.lens || s.lens.userData.stencilSet) continue;
       const ref = stencilRef++;
       const m = s.lens.material;
@@ -3671,8 +4193,8 @@ async function boot(def, lib) {
     lasers = asm.withInfo("laser");
     if (!lights.length) st.light = false;
     if (!lasers.length) st.laser = false;
-    for (const l of lights) l.data.lens.material.emissiveIntensity = st.light ? 6 : 0;
-    for (const l of lasers) l.data.lens.material.emissiveIntensity = st.laser ? 5 : 0;
+    for (const it of [...lights, ...lasers]) if (st.batt[battKey(it)] == null) st.batt[battKey(it)] = 1;
+    lensGlow();
     const mi = asm.info("mag")?.mag;
     if (mi?.rounds) mi.rounds.visible = st.mag > 0;
     const magObj = asm.installed.get("mag")?.obj;
@@ -3696,8 +4218,12 @@ async function boot(def, lib) {
       const up = new THREE8.Vector3(0, 1, 0).transformDirection(m);
       sights.push({ id, label, eye, dir, up, mag: s.mag || 1, zoom: s.zoom, reticle: s.reticle, eyeRelief: s.eyeRelief, magnifier: s.magnifier, x0: eye.x });
     };
+    // дополнительные прицельные оси модуля (коллиматор поверх призмы/оптики): V переключает на них
+    const pushAlt = (it) => (it.info?.alt || []).forEach((a, i) => push(it.slot.id + ":alt" + i, it.part.name + " — " + (a.label || "коллиматор"), it.obj, a));
     const opt = asm.installed.get("optic");
     if (opt?.info?.sight) push("optic", opt.part.name, opt.obj, opt.info.sight);
+    if (opt) pushAlt(opt);
+    for (const it of asm.installed.values()) if (it !== opt) pushAlt(it);
     for (const it of asm.installed.values()) if (it.slot.id !== "optic" && it.info?.sight && !it.info.sight.magnifier) push(it.slot.id, it.part.name, it.obj, it.info.sight);
     const mg = asm.installed.get("magnifier");
     if (mg?.info?.sight && sights[0]) {
@@ -3722,7 +4248,9 @@ async function boot(def, lib) {
     if (rear && front && !opticFolds) {
       const dir = front.clone().sub(rear).normalize();
       const type = rearIt ? rearIt.info.irons.type || "aperture" : base.irons?.type || "notch";
-      sights.push({ id: "irons", label: "Механический прицел", eye: rear, dir, mag: 1, irons: true, type, rearObj: rearIt?.obj || null, x0: rear.x });
+      const eyeDist = rearIt ? rearIt.info.irons.eye : base.irons?.eye;
+      const apertureR = rearIt ? rearIt.info.irons.hole : base.irons?.hole;
+      sights.push({ id: "irons", label: "Механический прицел", eye: rear, dir, mag: 1, irons: true, type, eyeDist, apertureR, rearObj: rearIt?.obj || base.nodes?.rearSight || null, x0: rear.x });
     }
     const optNow = sights.find((s) => s.id === "optic")?.label || null;
     const i = sights.findIndex((s) => s.id === prev);
@@ -3753,7 +4281,7 @@ async function boot(def, lib) {
     if (!s) return null;
     let ex = base.eyeX ?? -240;
     if (s.eyeRelief) ex = s.eye.x - s.eyeRelief;
-    else if (s.irons) ex = s.type === "aperture" ? s.eye.x - 75 : Math.min(ex, s.eye.x - 220);
+    else if (s.irons) ex = s.type === "aperture" ? s.eye.x - (s.eyeDist ?? 75) : Math.min(ex, s.eye.x - 220);
     else if (!s.irons) ex = Math.min(ex, s.eye.x - 60);
     const t = (ex - s.eye.x) / (s.dir.x || 1);
     const eyeGun = s.eye.clone().addScaledVector(s.dir, t);
@@ -4181,14 +4709,129 @@ async function boot(def, lib) {
     else if (!st.magAside && mi >= 0) st.sightIdx = mi;
     ui?.hud();
   }
+  /* ---------------------------------------------------------- батареи */
+  // Каждый модуль с фонарём/ЛЦУ — своя батарея (у комбо-блоков общая на оба излучателя).
+  // Время работы на полной мощности — 20…30 мин; стабилизированный драйвер держит яркость
+  // до ≈15 % заряда, дальше свет садится, под конец мерцает и гаснет.
+  const BATT_LS = "gunsmith:batt:" + def.id;
+  try {
+    Object.assign(st.batt, JSON.parse(localStorage.getItem(BATT_LS) || "{}"));
+  } catch (e) {
+  }
+  function battKey(it) {
+    return it.slotId + ":" + (it.part?.id || "base");
+  }
+  function lightSpec(it) {
+    const d = it.data, lm = d.lumens || 500;
+    const cd = d.cd ?? lm * 22;
+    return {
+      key: it.slotId + ":" + (it.part?.id || ""),
+      lm,
+      cd,
+      hot: d.hot ?? (cd / lm > 28 ? 0.15 : 0.21),
+      spill: d.spill ?? 0.085,
+      angle: d.angle ?? 0.62,
+      kelvin: d.kelvin ?? 6200,
+      throw: Math.min(130, 2 * Math.sqrt(cd) * 0.45),
+      lensR: (d.lensR ?? 11) / 1e3,
+      batt: d.batt ?? (lm >= 1000 ? 21 : lm >= 600 ? 24 : 28)
+    };
+  }
+  function laserBatt(it) {
+    return it.data.batt ?? (it.info?.light ? 26 : 30);
+  }
+  function battLevel(c) {
+    if (c <= 0) return 0;
+    let v = c > 0.15 ? 1 : 0.2 + 0.8 * Math.pow(c / 0.15, 1.6);
+    if (c < 0.04) v *= Math.random() < 0.12 ? 0.15 : 0.75 + Math.random() * 0.25;
+    return v;
+  }
+  function lensGlow() {
+    for (const l of lights) l.data.lens.material.emissiveIntensity = st.light ? 6 * battLevel(st.batt[battKey(l)] ?? 1) : 0;
+    for (const l of lasers) l.data.lens.material.emissiveIntensity = st.laser ? 5 * battLevel(st.batt[battKey(l)] ?? 1) : 0;
+  }
+  let battSaveT = 0, battHudT = 0;
+  function drainBatteries(dt) {
+    if (!st.light && !st.laser) return;
+    const used = new Map();
+    if (st.light) for (const l of lights) used.set(battKey(l), (used.get(battKey(l)) || 0) + 1 / (lightSpec(l).batt * 60));
+    if (st.laser) for (const l of lasers) used.set(battKey(l), (used.get(battKey(l)) || 0) + 1 / (laserBatt(l) * 60));
+    let dead = false;
+    for (const [k, rate] of used) {
+      const before = st.batt[k] ?? 1;
+      st.batt[k] = Math.max(0, before - rate * dt);
+      if (before > 0 && st.batt[k] === 0) dead = true;
+    }
+    if (dead) {
+      if (st.light && lights.every((l) => !(st.batt[battKey(l)] > 0))) {
+        st.light = false;
+        ui?.toast("Батарея фонаря села — U: заменить");
+      }
+      if (st.laser && lasers.every((l) => !(st.batt[battKey(l)] > 0))) {
+        st.laser = false;
+        ui?.toast("Батарея ЛЦУ села — U: заменить");
+      }
+      audio.click();
+    }
+    lensGlow();
+    battSaveT += dt;
+    battHudT += dt;
+    if (battSaveT > 5) {
+      battSaveT = 0;
+      try {
+        localStorage.setItem(BATT_LS, JSON.stringify(st.batt));
+      } catch (e) {
+      }
+    }
+    if (battHudT > 1 || dead) {
+      battHudT = 0;
+      ui?.hud();
+    }
+  }
+  function battInfo() {
+    const out = [];
+    const seen = new Set();
+    for (const [kind, list] of [["light", lights], ["laser", lasers]]) for (const l of list) {
+      const k = battKey(l);
+      const combo = seen.has(k);
+      seen.add(k);
+      if (combo) continue;
+      const c = st.batt[k] ?? 1;
+      const both = lights.some((x) => battKey(x) === k) && lasers.some((x) => battKey(x) === k);
+      const min = kind === "light" ? lightSpec(l).batt : laserBatt(l);
+      out.push({ label: both ? "Фонарь+ЛЦУ" : kind === "light" ? "Фонарь" : "ЛЦУ", pct: Math.round(c * 100), min: Math.round(c * min), on: kind === "light" ? st.light || (both && st.laser) : st.laser || (both && st.light) });
+    }
+    return out;
+  }
+  function replaceBatteries() {
+    const all = [...lights, ...lasers];
+    if (!all.length) {
+      ui?.toast("Нет модулей с батареями");
+      return;
+    }
+    for (const l of all) st.batt[battKey(l)] = 1;
+    audio.batteryChange?.() ?? audio.click();
+    try {
+      localStorage.setItem(BATT_LS, JSON.stringify(st.batt));
+    } catch (e) {
+    }
+    lensGlow();
+    ui?.toast("Батареи заменены: CR123A, 100 %");
+    ui?.hud();
+  }
   function toggleLight() {
     if (!lights.length) {
       ui?.toast("Фонарь не установлен");
       return;
     }
+    if (!st.light && lights.every((l) => !(st.batt[battKey(l)] > 0))) {
+      audio.click();
+      ui?.toast("Батарея фонаря разряжена — U: заменить");
+      return;
+    }
     st.light = !st.light;
-    audio.click();
-    for (const l of lights) l.data.lens.material.emissiveIntensity = st.light ? 6 : 0;
+    audio.tailcap?.(st.light) ?? audio.click();
+    lensGlow();
     ui?.hud();
   }
   function toggleLaser() {
@@ -4196,10 +4839,33 @@ async function boot(def, lib) {
       ui?.toast("ЛЦУ не установлен");
       return;
     }
+    if (!st.laser && lasers.every((l) => !(st.batt[battKey(l)] > 0))) {
+      audio.click();
+      ui?.toast("Батарея ЛЦУ разряжена — U: заменить");
+      return;
+    }
     st.laser = !st.laser;
     audio.click();
-    for (const l of lasers) l.data.lens.material.emissiveIntensity = st.laser ? 5 : 0;
+    lensGlow();
     ui?.hud();
+  }
+  /* ---------------------------------------------------------- время суток */
+  const TIME_ORDER = ["day", "dusk", "night"], TIME_LABEL = { day: "День", dusk: "Сумерки", night: "Ночь" };
+  function setTime(m) {
+    S.setTime(m);
+    fx.timeOfDay = m;
+    try {
+      localStorage.setItem("gunsmith:time", m);
+    } catch (e) {
+    }
+    app?.invalidate?.();
+    ui?.hud();
+  }
+  function cycleTime() {
+    const m = TIME_ORDER[(TIME_ORDER.indexOf(S.time) + 1) % TIME_ORDER.length];
+    setTime(m);
+    audio.click();
+    ui?.toast("Время суток: " + TIME_LABEL[m] + (m === "night" && !lights.length ? " — поставьте фонарь" : ""));
   }
   function toggleBipod() {
     const b = asm.withInfo("bipod")[0];
@@ -4385,6 +5051,8 @@ async function boot(def, lib) {
     KeyN: () => toggleMagnifier(),
     KeyC: toggleLight,
     KeyZ: toggleLaser,
+    KeyL: cycleTime,
+    KeyU: replaceBatteries,
     KeyB: toggleBipod,
     KeyK: toggleFold,
     KeyT: () => {
@@ -4495,8 +5163,31 @@ async function boot(def, lib) {
         m.material.transparent = true;
         m.material.depthWrite = false;
       }
-      m.material.opacity = 1 - 0.55 * k;
+      // глаз сфокусирован на мушке: близкий диоптр размыт и «просвечивает»
+      m.material.opacity = 1 - 0.62 * k;
     });
+  }
+  // Диоптр вблизи глаза: глаз держит в фокусе мушку, барабан вокруг отверстия размыт.
+  // Размытие — backdrop-filter по маске-кольцу, радиус отверстия считается из геометрии.
+  const ghost = document.createElement("div");
+  ghost.style.cssText = "position:fixed;inset:0;pointer-events:none;z-index:5;opacity:0;transition:none";
+  document.body.appendChild(ghost);
+  let ghostKey = "";
+  function ghostRing(p, k) {
+    if (!p || k < 0.02) {
+      if (ghostKey) ghost.style.opacity = "0", ghostKey = "";
+      return;
+    }
+    const rh = p.s.apertureR ?? 1.8, d = (p.s.eyeDist ?? 75) + 0.5;
+    const px = Math.atan(rh / d) / Math.tan(S.camera.fov * D2R2 / 2) * innerHeight / 2;
+    const key = Math.round(px) + "|" + k.toFixed(2);
+    if (key === ghostKey) return;
+    ghostKey = key;
+    const r0 = px * 0.92, r1 = px * 1.35;
+    const m = `radial-gradient(circle at 50% 50%, transparent ${r0}px, #000 ${r1}px)`;
+    ghost.style.backdropFilter = ghost.style.webkitBackdropFilter = `blur(${(9 * k).toFixed(1)}px) brightness(${(1 - 0.25 * k).toFixed(2)})`;
+    ghost.style.maskImage = ghost.style.webkitMaskImage = m;
+    ghost.style.opacity = String(Math.min(1, k * 1.2));
   }
   function update(dt) {
     tw.update(dt);
@@ -4562,7 +5253,7 @@ async function boot(def, lib) {
         const nv = !!p.s.nv && !st.magAside && st.adsT > 0.85;
         ui?.nv(nv);
         for (const q of sights) if (q.hide) q.hide.visible = !(nv && q === p.s);
-        defocus(p.s.irons && p.s.type === "aperture" ? p.s.rearObj : null, e);
+        ghostRing(p.s.irons && p.s.type === "aperture" ? p : null, e);
       }
       if (!st.ads && st.adsT === 0) {
         controls.enabled = true;
@@ -4579,6 +5270,7 @@ async function boot(def, lib) {
       ui?.nv(false);
       for (const q of sights) if (q.hide) q.hide.visible = true;
       if (defocused) restoreFocus();
+      ghostRing(null, 0);
       controls.enabled = true;
       controls.target.lerp(focusTarget, 1 - Math.pow(0.02, dt));
       if (focusDist) {
@@ -4590,17 +5282,19 @@ async function boot(def, lib) {
       controls.update();
     }
     gun.updateMatrixWorld(true);
+    drainBatteries(dt);
     if (lights.length && st.light) {
-      const L = lights[0];
+      const L = lights.find((l) => st.batt[battKey(l)] > 0) || lights[0];
       const p = L.obj.localToWorld(new THREE8.Vector3(...L.data.p));
       const dv = new THREE8.Vector3(1, 0, 0).transformDirection(L.obj.matrixWorld);
-      fx.setLight(true, p, dv, L.data.lumens);
+      fx.setLight(true, p, dv, lightSpec(L), battLevel(st.batt[battKey(L)] ?? 1), S.beamK ?? 0.06, S.camera);
     } else fx.setLight(false);
     if (lasers.length && st.laser) {
-      const L = lasers[0];
+      const L = lasers.find((l) => st.batt[battKey(l)] > 0) || lasers[0];
       const p = L.obj.localToWorld(new THREE8.Vector3(...L.data.p));
       const dv = new THREE8.Vector3(1, 0, 0).transformDirection(L.obj.matrixWorld);
-      fx.setLaser(true, p, dv, S.range.hitables);
+      fx.setLaserLevel(battLevel(st.batt[battKey(L)] ?? 1), S.beamK ?? 0.06);
+      fx.setLaser(true, p, dv, S.range.hitables, L.data.color ?? 16722458);
     } else fx.setLaser(false);
     fx.update(dt, (s, n) => audio.casing(0, s.kind, n > 1 ? 0.35 : 0.8), S.camera, fx.heat > 0.3 ? muzzleWorld(mzTmp) : null);
     S.range.update(dt);
@@ -4637,6 +5331,14 @@ async function boot(def, lib) {
     toggleMagnifier,
     toggleLight,
     toggleLaser,
+    replaceBatteries,
+    battInfo,
+    cycleTime,
+    setTime,
+    get time() {
+      return S.time;
+    },
+    timeLabel: () => TIME_LABEL[S.time],
     toggleBipod,
     toggleFold,
     toggleMag,
@@ -4661,6 +5363,14 @@ async function boot(def, lib) {
     } catch (e) {
       console.error("cfg", e);
     }
+  }
+  {
+    let tm = qs.get("time");
+    try {
+      tm = tm || localStorage.getItem("gunsmith:time");
+    } catch (e) {
+    }
+    S.setTime(TIME_ORDER.includes(tm) ? tm : "day");
   }
   applyConfig(def.defaults, { init: true });
   app.defaultStats = { ...st.stats };
@@ -4847,6 +5557,44 @@ function exps3(ctx) {
   root.add(rear, front);
   return { root, sight: { y: A, z: 0, x0: -14, x1: 37, r: 14, mag: 1, reticle: "holo", lens: front } };
 }
+// Trijicon MRO: короткая трубка с расширяющимся объективом 25 мм, барабаны сверху и справа.
+function mro(ctx, A) {
+  const k = ctx.kit();
+  const at = (g, t = {}) => T(g, { ...t, p: [t.p?.[0] || 0, A + (t.p?.[1] || 0), t.p?.[2] || 0] });
+  k.add("alu", clampBody(-20, 20, 5.5));
+  k.add("steel", qdLever(-14, 14, -1));
+  k.add("alu", extrudeX([[-12, 5, 1], [12, 5, 1], [12, A - 12, 3], [-12, A - 12, 3]], -18, 18, { bevel: 1.2 }));
+  k.add("alu", at(hollowLathe([[-30, 11.6], [-29, 12.8], [-8, 13.4], [14, 16.2], [26, 17.6], [30, 17.6], [31, 16.6]], 10.8, { seg: 44 })));
+  k.add("lensBlack", at(tubeX(10.9, 10.2, -29, 30, { seg: 32 })));
+  k.add("alu", at(ctx.C.knob(7.2, 6.5, 20), { r: [0, 0, 90], p: [0, 12.6, 0] }));
+  k.add("alu", at(ctx.C.knob(7.2, 6.5, 20), { r: [0, -90, 0], p: [0, 0, 12.8] }));
+  k.add("alu", at(ctx.C.knob(8.6, 5.5, 26), { r: [0, 90, 0], p: [-6, 0, -13.2] }));
+  k.add("paintWhite", at(box(0.6, 3, 0.6), { p: [0, 19.4, 3] }));
+  const root = node("mro", [k.build()]);
+  const rear = lens(ctx, at(ctx.C.lensDisc(10.8, -28)), "glassBlue");
+  const front = lens(ctx, at(ctx.C.lensDisc(16.6, 29.5)), "glassRed");
+  root.add(rear, front);
+  return { root, sight: { y: A, z: 0, x0: -30, x1: 31, r: 10, mag: 1, reticle: "dot", lens: front } };
+}
+// Holosun HS510C: открытый коллиматор с защитной рамкой и большим окном, солнечная батарея сверху.
+function hs510c(ctx) {
+  const k = ctx.kit();
+  const A = 35;
+  k.add("alu", clampBody(-22, 22, 6));
+  k.add("steel", qdLever(-16, 12, -1.5));
+  k.add("alu", extrudeX([[-17, 5, 1], [17, 5, 1], [17, 17, 3], [-17, 17, 3]], -34, 30, { bevel: 1.2 }));
+  const fr = shape([[-19, 14], [19, 14], [19, 50, 7], [-19, 50, 7]], [[[-14.5, 20, 3], [14.5, 20, 3], [14.5, 45, 5], [-14.5, 45, 5]]]);
+  k.add("alu", extrudeX(fr, 6, 16, { bevel: 1.2 }));
+  for (const s of [-1, 1]) k.add("alu", extrudeZ([[-30, 14], [16, 14], [16, 48, 4], [4, 50, 3], [-20, 20, 4]], 3, { bevel: 0.8, z: s * 17.5 }));
+  k.add("lensBlack", extrudeX(rrect(0, 51, 24, 1, 0.3), -8, 12, { bevel: 0.2 }));
+  k.add("glassBlue", extrudeX(rrect(0, 50.6, 22, 0.6, 0.2), -7, 11, { bevel: 0.1 }));
+  for (const x of [-22, -12]) k.add("rubber", cylZ(3.2, 18, 20.4, { c: 0.8, seg: 16 }), { p: [x, 12, 0] });
+  k.add("alu", T(ctx.C.knob(7, 5, 20), { r: [0, -90, 0], p: [-26, 12, 17] }));
+  const root = node("hs510c", [k.build()]);
+  const glass = lens(ctx, extrudeX(rrect(0, A - 2.4, 29, 25, 4), 10.4, 11.4, { bevel: 0.2 }), "glassBlue");
+  root.add(glass);
+  return { root, sight: { y: A, z: 0, x0: -30, x1: 16, r: 12, mag: 1, reticle: "holo", lens: glass } };
+}
 function acog(ctx) {
   const k = ctx.kit();
   const A = 38;
@@ -4871,7 +5619,11 @@ function acog(ctx) {
   const ob = lens(ctx, at(ctx.C.lensDisc(17, 73)), "glassAmber");
   const rmr = lens(ctx, extrudeX(rrect(0, A + 38, 20, 12, 4), 4, 5, { bevel: 0.2 }), "glassBlue");
   root.add(oc, ob, rmr);
-  return { root, sight: { y: A, z: 0, x0: -74, x1: 75, r: 15, mag: 4, reticle: "chevron", eyeRelief: 38, lens: oc } };
+  return {
+    root,
+    sight: { y: A, z: 0, x0: -74, x1: 75, r: 15, mag: 4, reticle: "chevron", eyeRelief: 38, lens: oc },
+    alt: [{ label: "RMR сверху", y: A + 38, z: 0, x0: -20, x1: 8, r: 6, mag: 1, reticle: "dot", lens: rmr }]
+  };
 }
 function lpvo(ctx) {
   const k = ctx.kit();
@@ -5106,6 +5858,9 @@ var OPTICS = [
   { id: "t2_low", cat: "optic", name: "Aimpoint Micro T-2", desc: "Коллиматор, низкое крепление (ось 20 мм). Для высоких планок АК", foot: [-18, 18], body: [-38, 38], stats: { weight: 135, ergo: -1, adsTime: 8 }, build: (c) => t2(c, 20) },
   { id: "t2_lrp", cat: "optic", name: "Aimpoint T-2 + LRP 39 мм", desc: "Коллиматор на кронштейне, нижняя треть с механикой AR", foot: [-18, 18], body: [-38, 38], stats: { weight: 190, ergo: -1, adsTime: 10 }, build: (c) => t2(c, 39) },
   { id: "exps3", cat: "optic", name: "EOTech EXPS3", desc: "Голографический, кольцо 68 MOA с точкой", foot: [-22, 22], body: [-48, 46], stats: { weight: 320, ergo: -3, adsTime: 14 }, build: exps3 },
+  { id: "mro", cat: "optic", name: "Trijicon MRO", desc: "Коллиматор-трубка, объектив 25 мм, точка 2 MOA, нижняя треть", foot: [-20, 20], body: [-31, 32], stats: { weight: 150, ergo: -1, adsTime: 9 }, build: (c) => mro(c, 39) },
+  { id: "hs510c", cat: "optic", name: "Holosun HS510C", desc: "Открытый коллиматор с рамкой, кольцо 65 MOA + точка, широкое поле", foot: [-22, 22], body: [-34, 30], stats: { weight: 250, ergo: -2, adsTime: 10 }, build: hs510c },
+  { id: "xps2", cat: "optic", name: "EOTech XPS2", desc: "Короткий голографический, одна батарея CR123", foot: [-18, 18], body: [-40, 46], stats: { weight: 255, ergo: -2, adsTime: 12 }, build: exps3 },
   { id: "acog", cat: "optic", name: "Trijicon ACOG TA31 4×32", desc: "Призменный 4×, шеврон с дальномерной шкалой", foot: [-32, 32], body: [-75, 76], stats: { weight: 480, ergo: -6, adsTime: 40 }, build: acog },
   { id: "lpvo", cat: "optic", name: "Прицел 1–6×24", desc: "Переменная кратность, колёсико — зум в прицеле", foot: [-38, 34], body: [-132, 106], stats: { weight: 720, ergo: -9, adsTime: 55 }, build: lpvo },
   { id: "mag3x", cat: "magnifier", name: "Aimpoint 3XMag-1 + FTS", desc: "Увеличитель 3×, откидывается вбок", foot: [-16, 16], body: [-57, 55], needs: mag1x39, stats: { weight: 330, ergo: -4, adsTime: 20 }, build: magnifier },
@@ -5280,12 +6035,32 @@ function scout(ctx, o) {
   k.add("alu", extrudeX([[-7, 3], [7, 3], [7, cy - r + 3], [-7, cy - r + 3]], -12, 12, { bevel: 1 }));
   k.add("steel", T(ctx.C.knob(6.2, 5, 16), { r: [0, -90, 0], p: [0, -2.5, 12.5] }));
   k.add("steel", cylZ(2.4, -14, 12.5, { seg: 12 }), { p: [0, -2.5, 0] });
+  if (o.tail2) k.add("rubber", at(cylX(6.4, L0 - 9, L0 - 4, { c: 1.2, seg: 24 })));
   const root = node(o.name, [k.build()]);
-  const le = lens(ctx, cylX(H - 3.3, L1 + 28.6, L1 + 29.4, { seg: 32 }).translate(0, cy, 0), "lampLens");
-  le.renderOrder = 0;
-  le.material.transparent = false;
-  root.add(le);
-  return { root, light: { p: [L1 + 30, cy, 0], lens: le, lumens: o.lm } };
+  const head = lampHead(ctx, H - 3.3, L1 + 29, L1 + 12, cy, o);
+  root.add(head.group);
+  return { root, light: { p: [L1 + 30, cy, 0], lens: head.glow, lumens: o.lm, cd: o.cd, kelvin: o.kelvin, hot: o.hot, spill: o.spill, batt: o.batt, lensR: H - 3.3 } };
+}
+// Голова фонаря: полированный отражатель (виден через стекло), светодиод на медной подложке,
+// просветлённое стекло. glow — светящийся диск перед светодиодом: его яркость ведёт app (батарея).
+function lampHead(ctx, r, xFront, xDeep, cy, o = {}) {
+  const k = ctx.kit();
+  const depth = xFront - xDeep, prof = [];
+  for (let i = 0; i <= 10; i++) {
+    const t = i / 10, x = xDeep + depth * t;
+    prof.push([x, 2.2 + (r - 2.2) * Math.sqrt(t)]);
+  }
+  const refl = latheX([[xDeep - 0.2, 0], ...prof, [xFront, r], [xFront, r + 0.3], [xDeep - 0.6, 2.6], [xDeep - 0.6, 0]].reverse(), { seg: 40, crease: 70 });
+  k.add(o.stipple ? "steelWorn" : "chrome", T(refl, { p: [0, cy, 0] }));
+  k.add("copper", T(box(0.8, 6, 6, { bevel: 0.2 }), { p: [xDeep + 0.2, cy, 0] }));
+  k.add("paintWhite", T(box(0.6, 3.2, 3.2, { bevel: 0.1 }), { p: [xDeep + 0.7, cy, 0] }));
+  const group = node("lampHead", [k.build()]);
+  const glass = lens(ctx, cylX(r + 0.2, xFront - 1.4, xFront - 0.6, { seg: 40 }).translate(0, cy, 0), "glass");
+  const glow = new ctx.THREE.Mesh(cylX(r * 0.55, xDeep + 1, xDeep + 1.4, { seg: 24 }).translate(0, cy, 0), ctx.mats.get("lampLens").clone());
+  glow.material.transparent = true;
+  glow.material.opacity = 0.95;
+  group.add(glass, glow);
+  return { group, glow };
 }
 function boxLaser(ctx, o) {
   const k = ctx.kit();
@@ -5313,7 +6088,11 @@ function boxLaser(ctx, o) {
   ll.renderOrder = 0;
   ll.material.transparent = false;
   root.add(ll);
-  return { root, laser: { p: [vis[0] + 2, vis[1], vis[2]], lens: ll } };
+  if (o.color) {
+    ll.material = ll.material.clone();
+    ll.material.emissive.setHex(o.color);
+  }
+  return { root, laser: { p: [vis[0] + 2, vis[1], vis[2]], lens: ll, color: o.color, batt: o.batt } };
 }
 function dbal(ctx) {
   const k = ctx.kit();
@@ -5403,7 +6182,11 @@ function harris(ctx) {
 var TACTICAL = [
   { id: "m600", cat: "light", name: "SureFire M600 Scout", desc: "Тактический фонарь 1000 лм", foot: [-13, 13], body: [-78, 72], stats: { weight: 175, ergo: -2 }, build: (c) => scout(c, { name: "m600", r: 12.7, headR: 15.9, tail: -76, head: 42, lm: 1e3 }) },
   { id: "m300", cat: "light", name: "SureFire M300 Mini Scout", desc: "Компактный фонарь 500 лм", foot: [-13, 13], body: [-60, 44], stats: { weight: 120, ergo: -1 }, build: (c) => scout(c, { name: "m300", r: 11, headR: 12.6, tail: -58, head: 14, lm: 500 }) },
+  { id: "m640", cat: "light", name: "SureFire M640DF Scout Pro", desc: "1500 лм, 38 000 кд — двойное топливо, мощный луч с широкой засветкой", foot: [-13, 13], body: [-84, 78], stats: { weight: 190, ergo: -2 }, build: (c) => scout(c, { name: "m640", r: 12.7, headR: 17.2, tail: -82, head: 46, lm: 1500, cd: 38e3, hot: 0.15, spill: 0.1, kelvin: 6300, batt: 20, tail2: true }) },
+  { id: "okw", cat: "light", name: "Modlite OKW-18650", desc: "Прожектор 1250 лм / 64 000 кд: узкое пятно бьёт на 500 м", foot: [-13, 13], body: [-92, 96], stats: { weight: 210, ergo: -3 }, build: (c) => scout(c, { name: "okw", r: 12.7, headR: 22.5, tail: -90, head: 50, lm: 1250, cd: 64e3, hot: 0.09, spill: 0.05, kelvin: 5200, batt: 28, tail2: true }) },
+  { id: "hlx", cat: "light", name: "Streamlight ProTac HL-X", desc: "1000 лм, тёплый нейтральный свет, дешёвые CR123", foot: [-13, 13], body: [-78, 70], stats: { weight: 160, ergo: -2 }, build: (c) => scout(c, { name: "hlx", r: 12.4, headR: 16.4, tail: -76, head: 40, lm: 1e3, cd: 2e4, hot: 0.2, spill: 0.11, kelvin: 5600, batt: 24 }) },
   { id: "peq15", cat: "laser", name: "L3 AN/PEQ-15", desc: "ЛЦУ: видимый + ИК лазер, ИК-осветитель", foot: [-18, 18], body: [-48, 60], stats: { weight: 215, ergo: -3, "hipSpread%": -18 }, build: (c) => boxLaser(c, { name: "peq15", L0: -48, L1: 56, H: 38, W: 50, mat: "polyTan", illum: 8 }) },
+  { id: "ls221g", cat: "laser", name: "Holosun LS221G (зелёный)", desc: "Зелёный лазер 520 нм: днём виден лучше красного", foot: [-18, 18], body: [-34, 46], stats: { weight: 135, ergo: -2, "hipSpread%": -16 }, build: (c) => boxLaser(c, { name: "ls221", L0: -34, L1: 44, H: 30, W: 34, mat: "poly", color: 3079936, batt: 24 }) },
   { id: "ls321", cat: "laser", name: "Holosun LS321", desc: "Компактный ЛЦУ с ИК-осветителем", foot: [-18, 18], body: [-34, 46], stats: { weight: 140, ergo: -2, "hipSpread%": -15 }, build: (c) => boxLaser(c, { name: "ls321", L0: -34, L1: 44, H: 32, W: 36, mat: "poly", illum: 6 }) },
   { id: "dbal", cat: "combo", name: "Steiner DBAL-PL", desc: "Комбо-блок: фонарь 300 лм + видимый лазер (C / Z)", foot: [-16, 16], body: [-42, 44], stats: { weight: 150, ergo: -2, "hipSpread%": -12 }, build: dbal },
   { id: "rvg", cat: "foregrip", name: "Magpul RVG", desc: "Вертикальная рукоятка, контроль отдачи", foot: [-17, 17], body: [-17, 17], stats: { weight: 70, "recoilV%": -6, "recoilH%": -10, ergo: 3, adsTime: 6 }, build: (c) => vgrip(c, { name: "rvg", len: 98, d: 32, ribs: true }) },
@@ -5479,16 +6262,14 @@ function pistolLight(ctx, o) {
   for (const s of [-1, 1]) k.add(o.mat || "alu", extrudeX([[s * 9.6, -1], [s * 12, -1], [s * 12, 1.5], [s * 9.6, 1.5]], -14, 12, { bevel: 0.3 }));
   k.add("steel", T(box(4, 3, 16), { p: [0, -0.6, 0] }));
   k.add(o.mat || "alu", extrudeX(rrect(0, cy, w, h, Math.min(w, h) * 0.3), x0, x1 - 14, { bevel: 1.6 }));
-  k.add(o.mat || "alu", T(latheX([[x1 - 16, 0], [x1 - 16, h * 0.46], [x1 - 10, headR], [x1, headR], [x1, headR - 1.6], [x1 - 1.2, 0]], { seg: 36 }), { p: [0, cy, 0] }));
+  k.add(o.mat || "alu", T(latheX([[x1 - 16, 0], [x1 - 16, h * 0.46], [x1 - 10, headR], [x1, headR], [x1, headR - 1.6], [x1 - 1, headR - 2.4]], { seg: 36 }), { p: [0, cy, 0] }));
   k.add("steel", T(tubeX(headR + 0.2, headR - 2.2, x1 - 2.4, x1 + 0.4, { seg: 36 }), { p: [0, cy, 0] }));
   // амбидекстральные клавиши сзади
   for (const s of [-1, 1]) k.add("poly", T(extrudeZ([[0, 0], [9, 0], [12, 7, 2], [0, 9, 2]], 4, { bevel: 0.8 }), { p: [x0 - 8, cy - 3, s * (w / 2 - 1)] }));
   const root = node(o.name, [k.build()]);
-  const le = lens(ctx, cylX(headR - 2.1, x1 - 1.2, x1 - 0.4, { seg: 32 }).translate(0, cy, 0), "lampLens");
-  le.renderOrder = 0;
-  le.material.transparent = false;
-  root.add(le);
-  const out = { root, light: { p: [x1 + 1, cy, 0], lens: le, lumens: o.lm } };
+  const head = lampHead(ctx, headR - 2.2, x1 - 0.6, x1 - (o.turbo ? 22 : 11), cy, o);
+  root.add(head.group);
+  const out = { root, light: { p: [x1 + 1, cy, 0], lens: head.glow, lumens: o.lm, cd: o.cd, hot: o.hot, spill: o.spill, kelvin: o.kelvin, batt: o.batt, lensR: headR - 2.2 } };
   if (o.laser) {
     const lk = ctx.kit();
     const lz = 0, ly = cy + h / 2 + 4;
@@ -5507,9 +6288,11 @@ var PISTOL = [
   { id: "rmr_t2", cat: "micro", name: "Trijicon RMR Type 2", desc: "Точка 3,25 MOA, самый живучий корпус", stats: { weight: 34, ergo: -1, adsTime: 10 }, build: rmrPistol },
   { id: "hs507c", cat: "micro", name: "Holosun HS507C X2", desc: "Кольцо 32 MOA + точка 2 MOA", stats: { weight: 43, ergo: -1, adsTime: 12 }, build: hs507 },
   { id: "acro_p2", cat: "micro", name: "Aimpoint ACRO P-2", desc: "Закрытый излучатель: грязь и вода не мешают", stats: { weight: 60, ergo: -2, adsTime: 14 }, build: acroP2 },
-  { id: "x300u", cat: "plight", name: "SureFire X300U-B", desc: "Фонарь 1000 лм, зацеп за паз рамки", foot: [-6, 6], body: [-20, 70], stats: { weight: 116, ergo: -3 }, build: (c) => pistolLight(c, { name: "x300", x0: -12, x1: 70, w: 30, h: 26, headR: 15.5, lm: 1e3 }) },
-  { id: "tlr7a", cat: "plight", name: "Streamlight TLR-7A", desc: "Компактный фонарь 500 лм", foot: [-6, 6], body: [-18, 52], stats: { weight: 71, ergo: -1 }, build: (c) => pistolLight(c, { name: "tlr7", x0: -10, x1: 52, w: 27, h: 22, headR: 12, lm: 500, mat: "poly" }) },
-  { id: "tlr8a", cat: "plight", name: "Streamlight TLR-8A", desc: "Фонарь 500 лм + красный ЛЦУ (C / Z)", foot: [-6, 6], body: [-18, 56], stats: { weight: 83, ergo: -2, "hipSpread%": -12 }, build: (c) => pistolLight(c, { name: "tlr8", x0: -10, x1: 56, w: 28, h: 23, headR: 12.5, lm: 500, laser: true, mat: "poly" }) }
+  { id: "x300u", cat: "plight", name: "SureFire X300U-B", desc: "Фонарь 1000 лм / 12 000 кд, зацеп за паз рамки", foot: [-6, 6], body: [-20, 70], stats: { weight: 116, ergo: -3 }, build: (c) => pistolLight(c, { name: "x300", x0: -12, x1: 70, w: 30, h: 26, headR: 15.5, lm: 1e3, cd: 12e3, hot: 0.2, spill: 0.12, kelvin: 6400, batt: 22 }) },
+  { id: "x300t", cat: "plight", name: "SureFire X300T-B Turbo", desc: "650 лм / 50 000 кд: узкий дальнобойный луч, длинная голова", foot: [-6, 6], body: [-20, 84], stats: { weight: 136, ergo: -4 }, build: (c) => pistolLight(c, { name: "x300t", x0: -12, x1: 84, w: 30, h: 26, headR: 19, lm: 650, cd: 5e4, hot: 0.08, spill: 0.04, kelvin: 6000, batt: 26, turbo: true }) },
+  { id: "tlr7a", cat: "plight", name: "Streamlight TLR-7A", desc: "Компактный фонарь 500 лм / 5000 кд", foot: [-6, 6], body: [-18, 52], stats: { weight: 71, ergo: -1 }, build: (c) => pistolLight(c, { name: "tlr7", x0: -10, x1: 52, w: 27, h: 22, headR: 12, lm: 500, cd: 5e3, hot: 0.24, spill: 0.14, kelvin: 6500, batt: 28, mat: "poly" }) },
+  { id: "tlr1hl", cat: "plight", name: "Streamlight TLR-1 HL", desc: "1000 лм / 13 000 кд, алюминиевый корпус", foot: [-6, 6], body: [-20, 74], stats: { weight: 122, ergo: -3 }, build: (c) => pistolLight(c, { name: "tlr1", x0: -12, x1: 74, w: 31, h: 25, headR: 15, lm: 1e3, cd: 13e3, hot: 0.19, spill: 0.11, kelvin: 5900, batt: 24 }) },
+  { id: "tlr8a", cat: "plight", name: "Streamlight TLR-8A", desc: "Фонарь 500 лм + красный ЛЦУ (C / Z)", foot: [-6, 6], body: [-18, 56], stats: { weight: 83, ergo: -2, "hipSpread%": -12 }, build: (c) => pistolLight(c, { name: "tlr8", x0: -10, x1: 56, w: 28, h: 23, headR: 12.5, lm: 500, cd: 6e3, laser: true, mat: "poly", batt: 25 }) }
 ];
 
 // src/engine/lib/grips.js
@@ -5712,16 +6495,33 @@ function mp5Barrel(ctx, k) {
   k.add("steelMatte", exZ([[168, 6], [181, 6], [181, TY - 4], [168, TY - 4]], 10, { bevel: 0.6 }));
 }
 function mp5RearSight(ctx, k) {
-  const { extrudeZ: exZ, cylY: cY, flutesX: fl, T: T2, box: bx, cylX: cX } = ctx.G;
+  const { extrudeZ: exZ, extrudeX: exX, cylY: cY, latheX: lX, flutesX: fl, T: T2, box: bx, shape: sh, circle: ci, rrect: rr } = ctx.G;
   const { TOP, SIGHT_Y: SY, REAR_X: RX } = H5;
-  // основание и поворотный барабан (ось вертикальная, в стенке — диоптры разного диаметра)
-  k.add("steelMatte", exZ([[RX - 16, TOP - 1], [RX + 22, TOP - 1], [RX + 18, TOP + 4, 2], [RX - 14, TOP + 5, 2]], 24, { bevel: 1 }));
-  for (const s of [-1, 1]) k.add("steelMatte", exZ([[RX - 10, TOP + 3], [RX + 8, TOP + 3], [RX + 6, SY + 7, 2], [RX - 8, SY + 7, 2]], 2.4, { bevel: 0.4, z: s * 12.4 }));
-  k.add("steelMatte", T2(cY(10.2, TOP + 3, SY + 6, { c: 1, seg: 32 }), { p: [RX, 0, 0] }));
-  k.add("steelMatte", T2(fl(9.9, 0, SY + 6 - TOP - 6, 28, 1.2, 0.7), { r: [0, 0, 90], p: [RX, TOP + 4, 0] }));
-  k.add("lensBlack", T2(cX(1.5, RX - 10.6, RX - 9.8, { seg: 16 }), { p: [0, SY, 0] }));
-  k.add("lensBlack", T2(cX(2.2, RX + 9.8, RX + 10.6, { seg: 16 }), { p: [0, SY, 0] }));
-  k.add("paintWhite", T2(bx(0.6, 3, 0.6), { p: [RX, SY + 2, 10.3] }));
+  const M = "steelMatte";
+  // основание и поворотный барабан (ось вертикальная). Барабан полый: диоптр — настоящее
+  // сквозное отверстие, через него видно кольцо мушки (раньше это был чёрный кружок).
+  k.add(M, exZ([[RX - 16, TOP - 1], [RX + 22, TOP - 1], [RX + 18, TOP + 4, 2], [RX - 14, TOP + 5, 2]], 24, { bevel: 1 }));
+  for (const s of [-1, 1]) k.add(M, exZ([[RX - 10, TOP + 3], [RX + 8, TOP + 3], [RX + 6, SY + 7, 2], [RX - 8, SY + 7, 2]], 2.4, { bevel: 0.4, z: s * 12.4 }));
+  const R = 10.2, Ri = 8.6, hb = 4.2, gap = Math.asin(hb / R) * 180 / Math.PI;
+  const drumY = (y0, y1, o = {}) => T2(lX([[y0, o.capLo ? 0 : Ri], [y0, R - 0.6], [y0 + 0.6, R], [y1 - 0.6, R], [y1, R - 0.6], [y1, o.capHi ? 0 : Ri], ...(o.capHi || o.capLo ? [] : [[y0, Ri]])], { seg: 40, a0: o.a0, arc: o.arc }), { r: [0, 0, 90], p: [RX, 0, 0] });
+  k.add(M, drumY(TOP + 3, SY - hb, { capLo: true }));
+  k.add(M, drumY(SY + hb, SY + 6, { capHi: true }));
+  for (const a of [gap, 180 + gap]) k.add(M, drumY(SY - hb, SY + hb, { a0: a, arc: 180 - 2 * gap }));
+  // рифление по окружности барабана — только вне окон диоптров
+  const fls = [];
+  for (let i = 0; i < 28; i++) {
+    const a = i / 28 * 360;
+    if (Math.abs(((a + 90) % 180) - 90) < gap + 8) continue;
+    fls.push(T2(T2(bx(SY + 6 - TOP - 7, 0.7, 1.2, { bevel: 0.25 }), { p: [(SY + 6 + TOP + 3) / 2, R + 0.15, 0] }), { r: [a, 0, 0] }));
+  }
+  k.add(M, T2(ctx.G.merge(fls), { r: [0, 0, 90], p: [RX, 0, 0] }));
+  // рабочий диоптр со стороны глаза (Ø3,6) и широкое окно спереди — не ограничивает поле
+  const plate = (x0, x1, rh) => exX(sh(rr(0, SY, 2 * hb + 0.6, 2 * hb + 0.6, 0.8), [ci(0, SY, rh, 28).reverse()]), x0, x1, { bevel: 0.25 });
+  k.add(M, plate(RX - R + 0.2, RX - Ri + 0.4, 1.8));
+  k.add(M, plate(RX + Ri - 0.4, RX + R - 0.2, 3.4));
+  k.add("steelWorn", T2(lX([[0, 1.8], [0, 2.5], [0.5, 2.5], [0.5, 1.8]], { seg: 28 }), { p: [RX - R, SY, 0] }));
+  k.add("lensBlack", T2(cY(Ri - 0.3, SY - hb - 0.05, SY - hb + 0.1, { seg: 32 }), { p: [RX, 0, 0] }));
+  k.add("paintWhite", T2(bx(0.6, 3, 0.6), { p: [RX, SY + hb + 1.4, R + 0.1] }));
 }
 function mp5Base(ctx) {
   const { node: nd, T: T2, box: bx, cylZ: cZ, cylY: cY, latheX: lX, extrudeZ: exZ } = ctx.G;
@@ -5729,7 +6529,9 @@ function mp5Base(ctx) {
   const nodes = {};
   mp5Receiver(ctx, k);
   mp5Barrel(ctx, k);
-  mp5RearSight(ctx, k);
+  const rs = ctx.kit();
+  mp5RearSight(ctx, rs);
+  nodes.rearSight = nd("rearSight", [rs.build()]);
   const body = k.build("receiver");
   // затвор в окне выброса
   const c = ctx.kit();
@@ -5743,7 +6545,7 @@ function mp5Base(ctx) {
   h.add("steelWorn", T2(lX([[0, 0], [0, 4.6], [1.5, 5.4], [8, 5.4], [9, 4.2], [9, 0]], { seg: 18 }), { r: [0, 90, 0], p: [0, 0, -H5.TUBE_R - 16] }));
   h.add("polySoft", T2(cY(5.8, -3.4, 3.4, { c: 1, seg: 18 }), { p: [-2, 0, -H5.TUBE_R - 22] }));
   nodes.handle = nd("handle", [h.build()], { p: [150, H5.TUBE_Y, 0] });
-  const root = nd("mp5a3", [body, nodes.carrier, nodes.handle]);
+  const root = nd("mp5a3", [body, nodes.rearSight, nodes.carrier, nodes.handle]);
   const { mount: mount2 } = ctx;
   root.add(mount2({ id: "hg", type: "hg", p: [0, 0, 0] }));
   root.add(mount2({ id: "claw", type: "claw", p: [-96, H5.TOP, 0] }));
@@ -5757,7 +6559,7 @@ function mp5Base(ctx) {
     anim: { carrierTravel: 62, handleTravel: 92, handleLock: 32, triggerAngle: 0.2 },
     eject: { p: [-20, 6, 18], dir: [0.45, 0.35, 1], speed: 4.2 },
     muzzle: [H5.MUZZLE, 0, 0],
-    irons: { rear: [H5.REAR_X, H5.SIGHT_Y, 0], front: [H5.FRONT_X, H5.SIGHT_Y, 0], type: "aperture" },
+    irons: { rear: [H5.REAR_X - 10, H5.SIGHT_Y, 0], front: [H5.FRONT_X, H5.SIGHT_Y, 0], type: "aperture", eye: 34, hole: 1.8 },
     eyeX: -300,
     focus: { center: [-90, -30, 0], size: 760 }
   };
@@ -5842,9 +6644,15 @@ function mp5Trigger(ctx, o) {
   // корпус под коробкой: от штифта (x=0) назад
   k.add(M, exZ([[4, 0], [-176, 0], [-176, -10, 3], [-160, -14, 4], [4, -14, 3]], 32, { bevel: 1.4 }));
   // рукоять под углом, со спинкой и выемками под пальцы
-  const g = [[-120, -12], [-112, -40, 6], [-118, -58, 10], [-114, -76, 8], [-122, -106, 8], [-160, -108, 8], [-162, -80, 12], [-156, -40, 12], [-164, -12, 6]];
-  k.add(M, exZ(g.map(([x, y, r]) => [x, y, r || 0]), 30, { bevel: 6, curve: 8 }));
-  for (let i = 0; i < 8; i++) for (const s of [-1, 1]) k.add(M, T2(bx(1.2, 30, 1, { bevel: 0.3 }), { p: [-150 + i * 3.2 - (i * 1.4), -70, s * 14.6], r: [0, 0, -14] }));
+  // рукоять SEF: наклон ≈12°, три выемки под пальцы спереди, «горб» под ладонь сзади, расширение у пятки
+  const gy = [-8, -22, -34, -44, -52, -60, -68, -76, -84, -93, -101, -106, -109];
+  const ga = [22, 21.5, 19, 21.5, 19.2, 21.8, 19.2, 21.5, 19.6, 21, 21.5, 20, 16];
+  const g2 = [23, 23, 23.5, 24.5, 25, 25, 24.6, 24, 23.4, 23, 23.4, 22.5, 18];
+  const gb = [15, 15, 14.8, 15, 15.2, 15.4, 15.4, 15.2, 15, 15, 15.4, 15, 12];
+  const secs = gy.map((y, i) => ({ c: [-140 + (y + 8) * 0.21, y], a: ga[i], a2: g2[i], b: gb[i], k: 2.6, kb: 3.2 }));
+  k.add(o.gripMat || "polyGrip", ctx.G.loftPath(secs, { seg: 40 }));
+  // пятка рукояти — крышка с антабкой-проушиной
+  k.add(M, T2(exZ([[-8, 0, 2], [44, 0, 2], [42, -4, 2], [-6, -4, 2]], 26, { bevel: 1.4 }), { p: [-181, -107, 0], r: [0, 0, -12] }));
   // спусковая скоба
   k.add(M, exZ(sh([[-44, -12], [-114, -12], [-110, -46, 8], [-60, -50, 10], [-44, -34, 6]], [[[-52, -16], [-106, -16], [-104, -40, 6], [-64, -44, 8], [-54, -32, 4]]]), 14, { bevel: 1.2 }));
   k.add("steelWorn", T2(cZ(3, -17, 17, { seg: 14 }), { p: [-8, -6, 0] }));
@@ -5872,18 +6680,20 @@ function stockA3(ctx) {
   const { extrudeZ: exZ, extrudeX: exX, T: T2, box: bx, cylX: cX, node: nd, cylZ: cZ } = ctx.G;
   const k = ctx.kit(), sl = ctx.kit();
   // направляющие в пазах коробки — видны по бортам
-  for (const s of [-1, 1]) sl.add("steel", T2(exX([[-3.2, -3], [3.2, -3], [3.2, 3], [-3.2, 3]].map(([z, y]) => [z, y, 1]), -300, 70, { bevel: 0.6 }), { p: [0, 2, s * (H5.HW + 3.2)] }));
+  // длина по реальному A3: 700 мм выдвинут / 550 мм сложен (ход 150)
+  for (const s of [-1, 1]) sl.add("steel", T2(exX([[-3.2, -3], [3.2, -3], [3.2, 3], [-3.2, 3]].map(([z, y]) => [z, y, 1]), -246, 60, { bevel: 0.6 }), { p: [0, 2, s * (H5.HW + 3.2)] }));
   // затыльник с резиновой накладкой
-  sl.add("steel", T2(exZ([[-2, 24, 3], [8, 24, 3], [8, -86, 6], [-2, -88, 6]], 44, { bevel: 2 }), { p: [-306, 0, 0] }));
-  sl.add("rubber", T2(exZ([[-3, 26, 6], [3, 26, 6], [3, -92, 8], [-3, -92, 8]], 48, { bevel: 2.5 }), { p: [-312, 0, 0] }));
-  for (const s of [-1, 1]) sl.add("steel", exZ([[-300, 4], [-300, -4], [-306, -28, 2], [-306, -20]], 3, { bevel: 0.6, z: s * 20 }));
-  sl.add("steelWorn", T2(cZ(4, -22, 22, { seg: 16 }), { p: [-300, -60, 0] }));
+  sl.add("steel", T2(exZ([[-2, 24, 3], [8, 24, 3], [8, -86, 6], [-2, -88, 6]], 44, { bevel: 2 }), { p: [-250, 0, 0] }));
+  sl.add("rubber", T2(exZ([[-3, 26, 6], [3, 26, 6], [3, -92, 8], [-3, -92, 8]], 48, { bevel: 2.5 }), { p: [-256, 0, 0] }));
+  for (let i = 0; i < 7; i++) sl.add("rubber", T2(bx(1.4, 2, 42), { p: [-259.4, 16 - i * 15, 0] }));
+  for (const s of [-1, 1]) sl.add("steel", exZ([[-244, 4], [-244, -4], [-250, -28, 2], [-250, -20]], 3, { bevel: 0.6, z: s * 20 }));
+  sl.add("steelWorn", T2(cZ(4, -22, 22, { seg: 16 }), { p: [-244, -60, 0] }));
   const slide = nd("a3slide", [sl.build()]);
   // защёлка на торце коробки
   k.add("steel", exZ([[0, 20], [-12, 20], [-12, -16, 3], [0, -16]], 40, { bevel: 1.2 }));
   k.add("steelWorn", T2(cZ(4.4, -24, 24, { seg: 18 }), { p: [-8, -8, 0] }));
   k.add("steel", T2(bx(10, 6, 12, { bevel: 1 }), { p: [-16, 22, 0] }));
-  return { root: nd("a3", [k.build(), slide]), fold: { node: slide, slide: 152 } };
+  return { root: nd("a3", [k.build(), slide]), fold: { node: slide, slide: 150 } };
 }
 function stockA2(ctx) {
   const { extrudeZ: exZ, T: T2, box: bx, cylZ: cZ, node: nd, loftX: lf, superEllipse: se } = ctx.G;

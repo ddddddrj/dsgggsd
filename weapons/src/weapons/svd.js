@@ -237,7 +237,7 @@ function svdStock(ctx, o) {
     k.add("steelWorn", T2(cZ(3, -20, 20, { seg: 12 }), { p: [-110, 16, 0] }));
   }
   k.add("steel", exZ([[18, 16], [0, 16], [0, -24], [18, -24]], 30, { bevel: 1.2 }));
-  slingLoop(ctx, k, "steel", [-300, -150, 0], { side: -1, w: 20 });
+  slingLoop(ctx, k, "steel", [-338, -145, 0], { side: -1, w: 20 });
   return { root: nd("svdstock", [k.build()]), cheek: { x: -140, y: 18 } };
 }
 function svdsStock(ctx) {

@@ -65,6 +65,44 @@ function exps3(ctx) {
   root.add(rear, front);
   return { root, sight: { y: A, z: 0, x0: -14, x1: 37, r: 14, mag: 1, reticle: "holo", lens: front } };
 }
+// Trijicon MRO: короткая трубка с расширяющимся объективом 25 мм, барабаны сверху и справа.
+function mro(ctx, A) {
+  const k = ctx.kit();
+  const at = (g, t = {}) => T(g, { ...t, p: [t.p?.[0] || 0, A + (t.p?.[1] || 0), t.p?.[2] || 0] });
+  k.add("alu", clampBody(-20, 20, 5.5));
+  k.add("steel", qdLever(-14, 14, -1));
+  k.add("alu", extrudeX([[-12, 5, 1], [12, 5, 1], [12, A - 12, 3], [-12, A - 12, 3]], -18, 18, { bevel: 1.2 }));
+  k.add("alu", at(hollowLathe([[-30, 11.6], [-29, 12.8], [-8, 13.4], [14, 16.2], [26, 17.6], [30, 17.6], [31, 16.6]], 10.8, { seg: 44 })));
+  k.add("lensBlack", at(tubeX(10.9, 10.2, -29, 30, { seg: 32 })));
+  k.add("alu", at(ctx.C.knob(7.2, 6.5, 20), { r: [0, 0, 90], p: [0, 12.6, 0] }));
+  k.add("alu", at(ctx.C.knob(7.2, 6.5, 20), { r: [0, -90, 0], p: [0, 0, 12.8] }));
+  k.add("alu", at(ctx.C.knob(8.6, 5.5, 26), { r: [0, 90, 0], p: [-6, 0, -13.2] }));
+  k.add("paintWhite", at(box(0.6, 3, 0.6), { p: [0, 19.4, 3] }));
+  const root = node("mro", [k.build()]);
+  const rear = lens(ctx, at(ctx.C.lensDisc(10.8, -28)), "glassBlue");
+  const front = lens(ctx, at(ctx.C.lensDisc(16.6, 29.5)), "glassRed");
+  root.add(rear, front);
+  return { root, sight: { y: A, z: 0, x0: -30, x1: 31, r: 10, mag: 1, reticle: "dot", lens: front } };
+}
+// Holosun HS510C: открытый коллиматор с защитной рамкой и большим окном, солнечная батарея сверху.
+function hs510c(ctx) {
+  const k = ctx.kit();
+  const A = 35;
+  k.add("alu", clampBody(-22, 22, 6));
+  k.add("steel", qdLever(-16, 12, -1.5));
+  k.add("alu", extrudeX([[-17, 5, 1], [17, 5, 1], [17, 17, 3], [-17, 17, 3]], -34, 30, { bevel: 1.2 }));
+  const fr = shape([[-19, 14], [19, 14], [19, 50, 7], [-19, 50, 7]], [[[-14.5, 20, 3], [14.5, 20, 3], [14.5, 45, 5], [-14.5, 45, 5]]]);
+  k.add("alu", extrudeX(fr, 6, 16, { bevel: 1.2 }));
+  for (const s of [-1, 1]) k.add("alu", extrudeZ([[-30, 14], [16, 14], [16, 48, 4], [4, 50, 3], [-20, 20, 4]], 3, { bevel: 0.8, z: s * 17.5 }));
+  k.add("lensBlack", extrudeX(rrect(0, 51, 24, 1, 0.3), -8, 12, { bevel: 0.2 }));
+  k.add("glassBlue", extrudeX(rrect(0, 50.6, 22, 0.6, 0.2), -7, 11, { bevel: 0.1 }));
+  for (const x of [-22, -12]) k.add("rubber", cylZ(3.2, 18, 20.4, { c: 0.8, seg: 16 }), { p: [x, 12, 0] });
+  k.add("alu", T(ctx.C.knob(7, 5, 20), { r: [0, -90, 0], p: [-26, 12, 17] }));
+  const root = node("hs510c", [k.build()]);
+  const glass = lens(ctx, extrudeX(rrect(0, A - 2.4, 29, 25, 4), 10.4, 11.4, { bevel: 0.2 }), "glassBlue");
+  root.add(glass);
+  return { root, sight: { y: A, z: 0, x0: -30, x1: 16, r: 12, mag: 1, reticle: "holo", lens: glass } };
+}
 function acog(ctx) {
   const k = ctx.kit();
   const A = 38;
@@ -89,7 +127,11 @@ function acog(ctx) {
   const ob = lens(ctx, at(ctx.C.lensDisc(17, 73)), "glassAmber");
   const rmr = lens(ctx, extrudeX(rrect(0, A + 38, 20, 12, 4), 4, 5, { bevel: 0.2 }), "glassBlue");
   root.add(oc, ob, rmr);
-  return { root, sight: { y: A, z: 0, x0: -74, x1: 75, r: 15, mag: 4, reticle: "chevron", eyeRelief: 38, lens: oc } };
+  return {
+    root,
+    sight: { y: A, z: 0, x0: -74, x1: 75, r: 15, mag: 4, reticle: "chevron", eyeRelief: 38, lens: oc },
+    alt: [{ label: "RMR сверху", y: A + 38, z: 0, x0: -20, x1: 8, r: 6, mag: 1, reticle: "dot", lens: rmr }]
+  };
 }
 function lpvo(ctx) {
   const k = ctx.kit();
@@ -324,6 +366,9 @@ var OPTICS = [
   { id: "t2_low", cat: "optic", name: "Aimpoint Micro T-2", desc: "Коллиматор, низкое крепление (ось 20 мм). Для высоких планок АК", foot: [-18, 18], body: [-38, 38], stats: { weight: 135, ergo: -1, adsTime: 8 }, build: (c) => t2(c, 20) },
   { id: "t2_lrp", cat: "optic", name: "Aimpoint T-2 + LRP 39 мм", desc: "Коллиматор на кронштейне, нижняя треть с механикой AR", foot: [-18, 18], body: [-38, 38], stats: { weight: 190, ergo: -1, adsTime: 10 }, build: (c) => t2(c, 39) },
   { id: "exps3", cat: "optic", name: "EOTech EXPS3", desc: "Голографический, кольцо 68 MOA с точкой", foot: [-22, 22], body: [-48, 46], stats: { weight: 320, ergo: -3, adsTime: 14 }, build: exps3 },
+  { id: "mro", cat: "optic", name: "Trijicon MRO", desc: "Коллиматор-трубка, объектив 25 мм, точка 2 MOA, нижняя треть", foot: [-20, 20], body: [-31, 32], stats: { weight: 150, ergo: -1, adsTime: 9 }, build: (c) => mro(c, 39) },
+  { id: "hs510c", cat: "optic", name: "Holosun HS510C", desc: "Открытый коллиматор с рамкой, кольцо 65 MOA + точка, широкое поле", foot: [-22, 22], body: [-34, 30], stats: { weight: 250, ergo: -2, adsTime: 10 }, build: hs510c },
+  { id: "xps2", cat: "optic", name: "EOTech XPS2", desc: "Короткий голографический, одна батарея CR123", foot: [-18, 18], body: [-40, 46], stats: { weight: 255, ergo: -2, adsTime: 12 }, build: exps3 },
   { id: "acog", cat: "optic", name: "Trijicon ACOG TA31 4×32", desc: "Призменный 4×, шеврон с дальномерной шкалой", foot: [-32, 32], body: [-75, 76], stats: { weight: 480, ergo: -6, adsTime: 40 }, build: acog },
   { id: "lpvo", cat: "optic", name: "Прицел 1–6×24", desc: "Переменная кратность, колёсико — зум в прицеле", foot: [-38, 34], body: [-132, 106], stats: { weight: 720, ergo: -9, adsTime: 55 }, build: lpvo },
   { id: "mag3x", cat: "magnifier", name: "Aimpoint 3XMag-1 + FTS", desc: "Увеличитель 3×, откидывается вбок", foot: [-16, 16], body: [-57, 55], needs: mag1x39, stats: { weight: 330, ergo: -4, adsTime: 20 }, build: magnifier },

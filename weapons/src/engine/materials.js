@@ -81,23 +81,31 @@ function makeTextures() {
   for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) brushed[y * S + x] = br[y * S + x * 7 % S] * 0.3 + br[y * 3 % S * S + x] * 0.7;
   const mix = new Float32Array(S * S);
   for (let i = 0; i < mix.length; i++) mix[i] = coarse[i] * 0.55 + fine[i] * 0.45;
-  const wood = (hue) => {
-    const n = fbm(S, 4, 301, 4), n2 = fbm(S, 3, 555, 16);
+  // Древесина: прямые продольные волокна (u — вдоль детали), лёгкая волнистость, годовые слои
+  // широкими полосами, поры-штрихи и неравномерная пропитка лаком. Раньше были «кольца» от шума —
+  // на прикладе СВД выглядело как огненный мрамор.
+  const wood = (hue, o = {}) => {
+    const warp = fbm(S, 3, o.seed ?? 301, 2), n2 = fbm(S, 4, (o.seed ?? 301) + 254, 8), blot = fbm(S, 3, (o.seed ?? 301) + 91, 3);
+    const pr = rng((o.seed ?? 301) * 7 + 1);
+    const pores = new Float32Array(S * S);
+    for (let i = 0; i < S * 5; i++) {
+      const x = pr() * S | 0, y = pr() * S | 0, L = 3 + pr() * 12 | 0;
+      for (let j = 0; j < L; j++) pores[y * S + (x + j) % S] = 0.5 + pr() * 0.5;
+    }
     return toTex(S, (i) => {
       const x = i % S, y = i / S | 0;
-      const v = y / S + n[i] * 0.35 + n2[i] * 0.04;
-      const ring = Math.pow(Math.abs(Math.sin(v * Math.PI * 9)), 6);
-      const fib = n2[y * S + x * 5 % S] * 0.25;
-      const k = 0.82 + fib * 0.6 - ring * 0.17 + (coarse[i] - 0.5) * 0.12;
+      const v = y / S + (warp[i] - 0.5) * (o.warp ?? 0.05);
+      const fine = Math.sin(v * Math.PI * 2 * (o.lines ?? 46)) * 0.5 + 0.5;
+      const late = Math.pow(Math.sin(v * Math.PI * 2 * (o.rings ?? 7)) * 0.5 + 0.5, 3);
+      const k = 0.9 - late * 0.16 - fine * 0.06 + (n2[i] - 0.5) * 0.12 - pores[i] * 0.2 - (blot[i] - 0.5) * (o.blot ?? 0.22);
       return [hue[0] * k, hue[1] * k, hue[2] * k];
     }, true);
-  };
-  const woodH = new Float32Array(S * S);
+  };  const woodH = new Float32Array(S * S);
   {
     const n = fbm(S, 4, 301, 4);
     for (let i = 0; i < S * S; i++) {
       const y = (i / S | 0) / S;
-      woodH[i] = Math.pow(Math.abs(Math.sin((y + n[i] * 0.35) * Math.PI * 9)), 6);
+      woodH[i] = 0.5 + 0.5 * Math.sin((y + (n[i] - 0.5) * 0.035) * Math.PI * 2 * 60) * 0.35 + (n[i] - 0.5) * 0.3;
     }
   }
   return {
@@ -108,8 +116,9 @@ function makeTextures() {
     nCast: normalFrom(mix, S, 3.2),
     nPoly: normalFrom(stipple, S, 5.5),
     nWood: normalFrom(woodH, S, 1.6),
-    woodBirch: wood([150, 66, 36]),
-    woodWalnut: wood([120, 70, 40])
+    // СВД: клеёная берёзовая фанера под красно-коричневым лаком
+    woodBirch: wood([104, 42, 24], { lines: 60, rings: 5, warp: 0.035, blot: 0.3 }),
+    woodWalnut: wood([104, 62, 38], { seed: 777, lines: 38, rings: 9, warp: 0.07 })
   };
 }
 function createMaterials(envMap) {
@@ -157,6 +166,8 @@ function createMaterials(envMap) {
   R4.spring = metal(4868942, 0.35, 0.9);
   R4.poly = poly(1776412, 0.74);
   R4.polySoft = poly(2105377, 0.86, { ns: 0.7 });
+  // текстура рукояти (Glock RTF / HK): мелкая «наждачка», заметнее обычного полимера
+  R4.polyGrip = poly(1250067, 0.84, { ns: 1.15, tile: 5, env: 0.6 });
   R4.polyFde = poly(9995359, 0.78);
   R4.polyFdeDark = poly(7299144, 0.8);
   R4.polyPlum = poly(4991522, 0.58, { ns: 0.3 });
@@ -174,7 +185,7 @@ function createMaterials(envMap) {
   R4.wood = phys({
     color: 16777215,
     map: rep(tex2.woodBirch, 160),
-    roughness: 0.52,
+    roughness: 0.46,
     metalness: 0,
     normalMap: rep(tex2.nWood, 160),
     normalScale: new THREE2.Vector2(0.25, 0.25),

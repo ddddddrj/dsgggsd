@@ -101,6 +101,14 @@ body.noui .ui{display:none}
 .a-n sup{font-size:13px;color:var(--acc);margin-left:2px;vertical-align:14px}
 .a-n small{font-size:14px;color:var(--tx3);font-weight:600;margin-left:3px}
 .ammo.low .a-n{color:var(--bad)}
+.a-batt{display:flex;flex-direction:column;gap:4px;margin-left:4px;padding-left:12px;border-left:1px solid var(--line)}
+.a-batt .bt{display:grid;grid-template-columns:78px 54px 34px;align-items:center;gap:6px;font-size:11px;color:var(--tx3)}
+.a-batt .bt.on span{color:var(--tx)}
+.a-batt i{display:block;height:6px;border-radius:3px;background:rgba(255,255,255,.1);overflow:hidden}
+.a-batt em{display:block;height:100%;background:var(--good)}
+.a-batt .bt.low em{background:var(--bad)}
+.a-batt .bt.low b{color:var(--bad)}
+.a-batt b{font-weight:650;color:var(--tx2);text-align:right;font-variant-numeric:tabular-nums}
 .a-m{display:flex;flex-direction:column;gap:3px}
 .a-m b{font-size:12px;letter-spacing:.08em;color:var(--acc)}
 .a-m span{font-size:12px;color:var(--tx2)}
@@ -121,7 +129,7 @@ body.noui .ui{display:none}
 
 /* режим прицеливания: убираем лишнее */
 .ui.ads .col-left,.ui.ads .mods{opacity:0;pointer-events:none;transition:opacity .2s}
-.ui.ads .bar .btn:not(.fire):not([data-id=ads]):not([data-id=sight]):not([data-id=mag3]):not([data-id=light]):not([data-id=laser]){display:none}
+.ui.ads .bar .btn:not(.fire):not([data-id=ads]):not([data-id=sight]):not([data-id=mag3]):not([data-id=light]):not([data-id=laser]):not([data-id=time]){display:none}
 .ads-hint{position:fixed;left:50%;top:16px;transform:translateX(-50%);padding:8px 14px;border-radius:8px;background:rgba(18,20,24,.9);border:1px solid var(--line);font-size:12.5px;display:none;text-align:center}
 .ads-hint.on{display:block}
 .ads-hint span{display:block;margin-top:2px;color:var(--tx3);font-size:11.5px}
