@@ -8891,6 +8891,7 @@ async function build(){
   buildShadowProxy();
   status('Рассеянный свет: затенение и отскок…'); await frame();
   await buildAmbientVolume();
+  if(DEBUG.get('avol') === '0'){ const k = AVOL_U.uAVolK.value; k.x = k.y = k.z = k.w = 0; }   // сравнение «до/после»
   scene.traverse(o=>{ if(o.isMesh && o.userData.glass && !o.userData.glassReg){ o.userData.glassReg = true; } });
   for(const o of collectGlass()) registerGlass(o, {hp:1});
   instanceGlass();
