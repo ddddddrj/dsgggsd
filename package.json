@@ -1,0 +1,14 @@
+{
+  "name": "angar-07",
+  "private": true,
+  "version": "1.1.0",
+  "description": "ANGAR-07 · ALPHA vs DELTA — single-file three.js + Bullet shoot house",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "0.23.1",
+    "three": "0.166.1"
+  }
+}

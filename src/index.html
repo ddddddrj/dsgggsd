@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ANGAR-07 · ALPHA vs DELTA</title>
+<style>
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;overflow:hidden;background:#000;color:#e6e7e9;
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+  canvas{display:block}
+  body{--acc:#d7dde4}
+  body[data-team="DELTA"]{--acc:#a9cf86}
+
+  #g_load{position:fixed;inset:0;z-index:60;display:flex;flex-direction:column;align-items:center;justify-content:center;background:#0a0b0c}
+  #g_load h1{margin:0 0 4px;font-size:24px;letter-spacing:.3em;font-weight:600}
+  #g_load .sub{font-size:12px;color:#7d8187;letter-spacing:.3em;margin-bottom:26px}
+  #g_status{font-size:13px;color:#8b8f95;letter-spacing:.06em;min-height:18px}
+  .spin{width:22px;height:22px;margin:18px auto 0;border:2px solid rgba(255,255,255,.12);border-top-color:#9aa;border-radius:50%;animation:sp 1s linear infinite}
+  @keyframes sp{to{transform:rotate(360deg)}}
+
+  #menu{position:fixed;inset:0;z-index:50;display:none;align-items:center;justify-content:center;
+    background:radial-gradient(ellipse at center, rgba(12,14,16,.72), rgba(4,5,6,.94))}
+  #menu .wrap{display:grid;grid-template-columns:340px 1fr;gap:28px;max-width:1100px;width:94vw;align-items:start}
+  #menu h2{margin:0 0 2px;font-size:22px;letter-spacing:.32em;font-weight:600}
+  #menu .sub{font-size:11px;color:#80858b;letter-spacing:.28em;margin-bottom:20px}
+  .teams{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:18px}
+  .team{cursor:pointer;border:1px solid rgba(255,255,255,.1);border-radius:6px;padding:16px 10px 12px;text-align:center;
+    background:linear-gradient(180deg,#151719,#0d0e10);transition:border-color .2s, transform .2s}
+  .team:hover{transform:translateY(-2px)}
+  .team img{width:64px;height:64px;display:block;margin:0 auto 8px;opacity:.95}
+  .team b{display:block;letter-spacing:.35em;font-size:13px;font-weight:600}
+  .team span{display:block;font-size:10.5px;color:#7f848a;margin-top:4px;letter-spacing:.08em}
+  #team_ALPHA.sel{border-color:#d7dde4;background:linear-gradient(180deg,#1b1d20,#0f1012)}
+  #team_DELTA.sel{border-color:#a9cf86;background:linear-gradient(180deg,#1a2016,#0e110c)}
+  #team_DELTA b{color:#b9d99a}
+  .lbl{font-size:10.5px;letter-spacing:.24em;color:#7f848a;margin:6px 0 8px}
+  #spawns{display:flex;flex-direction:column;gap:6px;margin-bottom:18px}
+  .sp{text-align:left;background:#121416;border:1px solid rgba(255,255,255,.08);color:#cfd2d6;padding:9px 12px;border-radius:5px;cursor:pointer;font:13px inherit}
+  .sp b{color:var(--acc);margin-right:8px;font-family:ui-monospace,Menlo,Consolas,monospace}
+  .sp.sel{border-color:var(--acc);background:#181b1e}
+  .btns{display:flex;gap:10px;flex-wrap:wrap}
+  button.main{font:600 14px inherit;letter-spacing:.2em;color:#0b0c0d;background:var(--acc);border:0;border-radius:5px;padding:13px 30px;cursor:pointer}
+  button.ghost{font:600 12px inherit;letter-spacing:.14em;color:#c9ccd0;background:transparent;border:1px solid rgba(255,255,255,.18);border-radius:5px;padding:12px 16px;cursor:pointer}
+  #minimap{width:100%;aspect-ratio:84/64;border:1px solid rgba(255,255,255,.08);border-radius:6px;cursor:crosshair;background:#111}
+  .keys{display:grid;grid-template-columns:repeat(3,1fr);gap:4px 14px;margin-top:14px;font-size:11.5px;color:#8d9197}
+  .keys b{display:inline-block;min-width:64px;color:#dfe2e5;font:600 11px ui-monospace,Menlo,Consolas,monospace}
+  #q_line{font-size:11px;color:#62666b;margin-top:10px;letter-spacing:.06em}
+
+  #hud{position:fixed;inset:0;z-index:20;pointer-events:none;display:none}
+  #cross{--g:10px;position:absolute;left:50%;top:50%;width:0;height:0}
+  #cross i{position:absolute;background:rgba(240,242,244,.9);box-shadow:0 0 2px #000}
+  #cross i:nth-child(1){width:2px;height:8px;left:-1px;top:calc(-1*var(--g) - 8px)}
+  #cross i:nth-child(2){width:2px;height:8px;left:-1px;top:var(--g)}
+  #cross i:nth-child(3){height:2px;width:8px;top:-1px;left:calc(-1*var(--g) - 8px)}
+  #cross i:nth-child(4){height:2px;width:8px;top:-1px;left:var(--g)}
+  #cross i:nth-child(5){width:2px;height:2px;left:-1px;top:-1px}
+  .panel{position:absolute;display:flex;align-items:center;gap:10px;text-shadow:0 1px 2px #000}
+  #p_hp{left:22px;bottom:20px}
+  #hud_emblem{width:36px;height:36px;opacity:.9}
+  #hp_wrap{width:180px;height:6px;background:rgba(255,255,255,.12);border-radius:3px;overflow:hidden}
+  #hp_bar{height:100%;width:100%;background:var(--acc);transition:width .15s}
+  #hp_num{font:600 20px ui-monospace,Menlo,Consolas,monospace;min-width:44px}
+  #hud_team{font-size:10.5px;letter-spacing:.2em;color:#aeb2b7;margin-bottom:4px}
+  #p_ammo{right:24px;bottom:20px;flex-direction:column;align-items:flex-end;gap:2px}
+  #ammo{font:600 22px ui-monospace,Menlo,Consolas,monospace}
+  #nades{font:12px ui-monospace,Menlo,Consolas,monospace;color:#aeb2b7}
+  #clock{position:absolute;top:12px;left:50%;transform:translateX(-50%);font-size:11px;letter-spacing:.18em;color:#a7abb0;text-shadow:0 1px 2px #000}
+  #hints{position:absolute;left:22px;top:14px;font-size:11px;line-height:1.7;color:#9fa3a8;text-shadow:0 1px 2px #000;transition:opacity .3s}
+  #hints.hide{opacity:0}
+  #hints b{color:#e1e3e6;font-family:ui-monospace,Menlo,Consolas,monospace}
+  #dmg{position:absolute;inset:0;opacity:0;background:radial-gradient(ellipse at center, rgba(120,0,0,0) 45%, rgba(140,10,6,.55) 100%)}
+  #concuss{position:absolute;inset:0;opacity:0;background:rgba(210,215,220,.25);backdrop-filter:blur(2px)}
+  #burn{position:absolute;inset:0;opacity:0;background:
+    radial-gradient(ellipse 120% 70% at 50% 115%, rgba(255,120,30,.55), rgba(255,80,10,.18) 45%, rgba(0,0,0,0) 70%),
+    radial-gradient(ellipse at center, rgba(0,0,0,0) 55%, rgba(120,30,0,.45) 100%)}
+  #burnmsg{position:absolute;left:50%;bottom:22%;transform:translateX(-50%);font-size:13px;letter-spacing:.3em;color:#ffb070;
+    text-shadow:0 0 6px #000,0 1px 2px #000;opacity:0;transition:opacity .25s}
+  #burnmsg b{font-family:ui-monospace,Menlo,Consolas,monospace;color:#fff}
+  #dead{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;opacity:0;transition:opacity .6s;
+    background:rgba(10,0,0,.35);font-size:20px;letter-spacing:.4em;color:#e8c9c4}
+  #fps{position:fixed;left:8px;bottom:64px;z-index:40;display:none;color:#9aa;font:11px/1.5 ui-monospace,Menlo,Consolas,monospace;text-shadow:0 0 3px #000;pointer-events:none}
+  @media (max-width:860px){ #menu .wrap{grid-template-columns:1fr} }
+</style>
+</head>
+<body data-team="ALPHA">
+<div id="g_load">
+  <h1>ANGAR-07</h1>
+  <div class="sub">ALPHA · DELTA · SHOOT HOUSE</div>
+  <div id="g_status">Загрузка…</div>
+  <div class="spin"></div>
+</div>
+
+<div id="menu">
+  <div class="wrap">
+    <div>
+      <h2 id="menu_title">ANGAR-07</h2>
+      <div class="sub">ВЫБОР КОМАНДЫ И ТОЧКИ</div>
+      <div class="teams">
+        <div class="team sel" id="team_ALPHA"><img alt=""><b>ALPHA</b><span>запад · чёрный</span></div>
+        <div class="team" id="team_DELTA"><img alt=""><b>DELTA</b><span>восток · камуфляж</span></div>
+      </div>
+      <div class="lbl">ТОЧКА ВОЗРОЖДЕНИЯ</div>
+      <div id="spawns"></div>
+      <div class="btns">
+        <button class="main" id="go">В БОЙ</button>
+        <button class="ghost" id="resume" style="display:none">ПРОДОЛЖИТЬ</button>
+        <button class="ghost" id="spectate">НАБЛЮДАТЕЛЬ</button>
+      </div>
+      <div id="q_line">качество: <span id="q_name"></span> · ?q=low|med|high|ultra</div>
+    </div>
+    <div>
+      <canvas id="minimap" width="840" height="640"></canvas>
+      <div class="keys">
+        <div><b>WASD</b>движение</div><div><b>Shift</b>бег</div><div><b>Space</b>прыжок</div>
+        <div><b>C / Ctrl</b>присесть</div><div><b>ЛКМ</b>огонь</div><div><b>ПКМ</b>прицел</div>
+        <div><b>R</b>перезарядка</div><div><b>G</b>граната</div><div><b>T</b>зажигательная</div>
+        <div><b>F</b>полёт/ходьба</div><div><b>M</b>меню / точка</div><div><b>N / P</b>время суток</div>
+        <div><b>H</b>подсказки</div><div><b>F3</b>FPS</div><div><b>Esc</b>пауза</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="hud">
+  <div id="dmg"></div><div id="concuss"></div><div id="burn"></div>
+  <div id="burnmsg">ГОРИШЬ · <b>C</b> — СБИТЬ ПЛАМЯ</div>
+  <div id="cross"><i></i><i></i><i></i><i></i><i></i></div>
+  <div id="clock"></div>
+  <div id="hints">
+    <b>ЛКМ</b> огонь — дерево пробивается насквозь · <b>G</b> граната · <b>T</b> зажигательная<br>
+    стёкла бьются, стойки ломаются, огонь перекидывается по OSB · <b>H</b> скрыть
+  </div>
+  <div class="panel" id="p_hp">
+    <img id="hud_emblem" alt="">
+    <div><div id="hud_team"></div><div id="hp_wrap"><div id="hp_bar"></div></div></div>
+    <div id="hp_num">100</div>
+  </div>
+  <div class="panel" id="p_ammo"><div id="ammo">30 / ∞</div><div id="nades"></div></div>
+  <div id="dead">ВЫБЫЛ</div>
+</div>
+<div id="fps"></div>
+
+<!--THREE_BUNDLE-->
+<script type="module">
+<!--GAME-->
+</script>
+
+<!-- ===================== ammo.js (Bullet Physics), zlib license ===================== -->
+<script>
+<!--AMMO-->
+</script>
+<script type="application/octet-stream" id="ammo-wasm"><!--AMMO_WASM--></script>
+</body>
+</html>
