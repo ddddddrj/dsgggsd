@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ANGAR-07 · ALPHA vs DELTA</title>
+<style>
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;overflow:hidden;background:#000;color:#e6e7e9;
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+  canvas{display:block}
+  body{--acc:#d7dde4}
+  body[data-team="DELTA"]{--acc:#a9cf86}
+
+  #g_load{position:fixed;inset:0;z-index:60;display:flex;flex-direction:column;align-items:center;justify-content:center;background:#0a0b0c}
+  #g_load h1{margin:0 0 4px;font-size:24px;letter-spacing:.3em;font-weight:600}
+  #g_load .sub{font-size:12px;color:#7d8187;letter-spacing:.3em;margin-bottom:26px}
+  #g_status{font-size:13px;color:#8b8f95;letter-spacing:.06em;min-height:18px}
+  .spin{width:22px;height:22px;margin:18px auto 0;border:2px solid rgba(255,255,255,.12);border-top-color:#9aa;border-radius:50%;animation:sp 1s linear infinite}
+  @keyframes sp{to{transform:rotate(360deg)}}
+
+  /* Меню прокручивается и ужимается: в невысоком окне (1280×577 и ниже)
+     миникарта и список клавиш не обрезаются. За меню — замороженный кадр с размытием. */
+  #menu{position:fixed;inset:0;z-index:50;display:none;align-items:safe center;justify-content:center;overflow:auto;
+    padding:clamp(10px,3vh,32px) 0;overscroll-behavior:contain;
+    background:radial-gradient(ellipse at center, rgba(12,14,16,.55), rgba(4,5,6,.9));
+    -webkit-backdrop-filter:blur(7px) saturate(.8);backdrop-filter:blur(7px) saturate(.8)}
+  #menu .wrap{display:grid;grid-template-columns:340px minmax(0,1fr);gap:clamp(14px,2.4vw,28px);max-width:1100px;width:94vw;align-items:start;margin:auto}
+  #menu h2{margin:0 0 2px;font-size:22px;letter-spacing:.32em;font-weight:600}
+  #menu .sub{font-size:11px;color:#80858b;letter-spacing:.28em;margin-bottom:20px}
+  .teams{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:18px}
+  .team{cursor:pointer;border:1px solid rgba(255,255,255,.1);border-radius:6px;padding:16px 10px 12px;text-align:center;
+    background:linear-gradient(180deg,#151719,#0d0e10);transition:border-color .2s, transform .2s}
+  .team:hover{transform:translateY(-2px)}
+  .team img{width:64px;height:64px;display:block;margin:0 auto 8px;opacity:.95}
+  .team b{display:block;letter-spacing:.35em;font-size:13px;font-weight:600}
+  .team span{display:block;font-size:10.5px;color:#7f848a;margin-top:4px;letter-spacing:.08em}
+  #team_ALPHA.sel{border-color:#d7dde4;background:linear-gradient(180deg,#1b1d20,#0f1012)}
+  #team_DELTA.sel{border-color:#a9cf86;background:linear-gradient(180deg,#1a2016,#0e110c)}
+  #team_DELTA b{color:#b9d99a}
+  .lbl{font-size:10.5px;letter-spacing:.24em;color:#7f848a;margin:6px 0 8px}
+  #spawns{display:flex;flex-direction:column;gap:6px;margin-bottom:18px}
+  .sp{text-align:left;background:#121416;border:1px solid rgba(255,255,255,.08);color:#cfd2d6;padding:9px 12px;border-radius:5px;cursor:pointer;font:13px inherit}
+  .sp b{color:var(--acc);margin-right:8px;font-family:ui-monospace,Menlo,Consolas,monospace}
+  .sp.sel{border-color:var(--acc);background:#181b1e}
+  .btns{display:flex;gap:10px;flex-wrap:wrap}
+  button.main{font:600 14px inherit;letter-spacing:.2em;color:#0b0c0d;background:var(--acc);border:0;border-radius:5px;padding:13px 30px;cursor:pointer}
+  button.ghost{font:600 12px inherit;letter-spacing:.14em;color:#c9ccd0;background:transparent;border:1px solid rgba(255,255,255,.18);border-radius:5px;padding:12px 16px;cursor:pointer}
+  #minimap{display:block;width:auto;height:auto;max-width:100%;max-height:calc(100vh - 190px);min-height:150px;aspect-ratio:84/64;
+    border:1px solid rgba(255,255,255,.08);border-radius:6px;cursor:crosshair;background:#111}
+  .tabs{display:flex;gap:6px;margin-bottom:8px}
+  .tabs button{font:600 11px inherit;letter-spacing:.18em;color:#9aa0a6;background:transparent;border:1px solid rgba(255,255,255,.1);border-radius:4px;padding:6px 12px;cursor:pointer}
+  .tabs button.sel{color:#0b0c0d;background:var(--acc);border-color:var(--acc)}
+  .keys{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:3px 14px;margin-top:12px;font-size:11.5px;color:#8d9197}
+  .keys b{display:inline-block;min-width:64px;color:#dfe2e5;font:600 11px ui-monospace,Menlo,Consolas,monospace}
+  #q_line{font-size:11px;color:#62666b;margin-top:10px;letter-spacing:.06em}
+  #m_msg{min-height:16px;margin-top:10px;font-size:12px;color:#e0a77a;letter-spacing:.04em}
+  #settings{display:none;max-height:calc(100vh - 120px);overflow:auto;padding-right:6px}
+  #settings .row{display:grid;grid-template-columns:170px 1fr 56px;align-items:center;gap:10px;margin:7px 0;font-size:12.5px;color:#c9ccd0}
+  #settings .row output{font:12px ui-monospace,Menlo,Consolas,monospace;color:#dfe2e5;text-align:right}
+  #settings input[type=range]{width:100%;accent-color:var(--acc)}
+  #settings select{background:#121416;color:#dfe2e5;border:1px solid rgba(255,255,255,.14);border-radius:4px;padding:5px}
+  #binds{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:4px 16px;margin-top:6px}
+  #binds .bind{display:flex;justify-content:space-between;align-items:center;font-size:12px;color:#aeb2b7}
+  #binds button{min-width:92px;font:600 11px ui-monospace,Menlo,Consolas,monospace;color:#dfe2e5;background:#121416;border:1px solid rgba(255,255,255,.12);border-radius:4px;padding:5px 8px;cursor:pointer}
+  #binds button.wait{border-color:var(--acc);color:var(--acc)}
+  #g_load .err{max-width:560px;padding:0 24px;text-align:center}
+  #g_load .err b{display:block;font-size:16px;color:#e6a59d;margin-bottom:8px;letter-spacing:.04em}
+  #g_load .err p{font-size:13px;line-height:1.55;color:#9aa0a6;margin:0 0 18px}
+  @media (max-height:640px){
+    #menu h2{font-size:18px} #menu .sub{margin-bottom:10px}
+    .teams{gap:8px;margin-bottom:10px} .team{padding:8px 8px 6px} .team img{width:40px;height:40px;margin-bottom:4px}
+    #spawns{margin-bottom:10px} .sp{padding:6px 10px}
+    .keys{font-size:10.5px;gap:1px 10px} .keys b{min-width:52px}
+    button.main{padding:10px 22px} button.ghost{padding:9px 12px}
+  }
+
+  #hud{position:fixed;inset:0;z-index:20;pointer-events:none;display:none}
+  #cross{--g:10px;position:absolute;left:50%;top:50%;width:0;height:0}
+  #cross i{position:absolute;background:rgba(240,242,244,.9);box-shadow:0 0 2px #000}
+  #cross i:nth-child(1){width:2px;height:8px;left:-1px;top:calc(-1*var(--g) - 8px)}
+  #cross i:nth-child(2){width:2px;height:8px;left:-1px;top:var(--g)}
+  #cross i:nth-child(3){height:2px;width:8px;top:-1px;left:calc(-1*var(--g) - 8px)}
+  #cross i:nth-child(4){height:2px;width:8px;top:-1px;left:var(--g)}
+  #cross i:nth-child(5){width:2px;height:2px;left:-1px;top:-1px}
+  .panel{position:absolute;display:flex;align-items:center;gap:10px;text-shadow:0 1px 2px #000}
+  #p_hp{left:22px;bottom:20px}
+  #hud_emblem{width:36px;height:36px;opacity:.9}
+  #hp_wrap{width:180px;height:6px;background:rgba(255,255,255,.12);border-radius:3px;overflow:hidden}
+  #hp_bar{height:100%;width:100%;background:var(--acc);transition:width .15s}
+  #hp_num{font:600 20px ui-monospace,Menlo,Consolas,monospace;min-width:44px}
+  #hud_team{font-size:10.5px;letter-spacing:.2em;color:#aeb2b7;margin-bottom:4px}
+  #p_ammo{right:24px;bottom:20px;flex-direction:column;align-items:flex-end;gap:2px}
+  #ammo{font:600 22px ui-monospace,Menlo,Consolas,monospace}
+  #nades{font:12px ui-monospace,Menlo,Consolas,monospace;color:#aeb2b7}
+  #clock{position:absolute;top:36px;left:50%;transform:translateX(-50%);font-size:11px;letter-spacing:.18em;color:#a7abb0;text-shadow:0 1px 2px #000}
+  #hints{position:absolute;left:22px;top:14px;font-size:11px;line-height:1.7;color:#9fa3a8;text-shadow:0 1px 2px #000;transition:opacity .3s}
+  #hints.hide{opacity:0}
+  #hints b{color:#e1e3e6;font-family:ui-monospace,Menlo,Consolas,monospace}
+  #dmg{position:absolute;inset:0;opacity:0;background:radial-gradient(ellipse at center, rgba(120,0,0,0) 45%, rgba(140,10,6,.55) 100%)}
+  #concuss{position:absolute;inset:0;opacity:0;background:rgba(210,215,220,.25);backdrop-filter:blur(2px)}
+  #burn{position:absolute;inset:0;opacity:0;background:
+    radial-gradient(ellipse 120% 70% at 50% 115%, rgba(255,120,30,.55), rgba(255,80,10,.18) 45%, rgba(0,0,0,0) 70%),
+    radial-gradient(ellipse at center, rgba(0,0,0,0) 55%, rgba(120,30,0,.45) 100%)}
+  #burnmsg{position:absolute;left:50%;bottom:22%;transform:translateX(-50%);font-size:13px;letter-spacing:.3em;color:#ffb070;
+    text-shadow:0 0 6px #000,0 1px 2px #000;opacity:0;transition:opacity .25s}
+  #burnmsg b{font-family:ui-monospace,Menlo,Consolas,monospace;color:#fff}
+  #dead{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;opacity:0;transition:opacity .6s;
+    background:rgba(10,0,0,.35);font-size:20px;letter-spacing:.4em;color:#e8c9c4}
+  /* попадание: косой крест у прицела */
+  #hitm{position:absolute;left:50%;top:50%;width:0;height:0;opacity:0}
+  #hitm i{position:absolute;width:2px;height:9px;background:#fff;box-shadow:0 0 2px #000;left:-1px;top:-4.5px}
+  #hitm i:nth-child(1){transform:rotate(45deg) translateY(-11px)} #hitm i:nth-child(2){transform:rotate(135deg) translateY(-11px)}
+  #hitm i:nth-child(3){transform:rotate(225deg) translateY(-11px)} #hitm i:nth-child(4){transform:rotate(315deg) translateY(-11px)}
+  #hitm.kill i{background:#ff6a4a}
+  /* откуда прилетел урон: дуги вокруг прицела */
+  #dmgdir{position:absolute;left:50%;top:50%;width:0;height:0}
+  #dmgdir i{position:absolute;left:-60px;top:-60px;width:120px;height:120px;border-radius:50%;opacity:0;
+    border-top:5px solid rgba(220,40,20,.9);filter:drop-shadow(0 0 3px rgba(0,0,0,.8));transition:opacity .15s}
+  #compass{position:absolute;top:10px;left:50%;transform:translateX(-50%);width:min(440px,50vw);height:22px;overflow:hidden;
+    -webkit-mask-image:linear-gradient(90deg,transparent,#000 18%,#000 82%,transparent);mask-image:linear-gradient(90deg,transparent,#000 18%,#000 82%,transparent)}
+  #compass .strip{position:absolute;top:0;left:0;height:22px;white-space:nowrap;font:600 11px ui-monospace,Menlo,Consolas,monospace;color:#cfd3d7;text-shadow:0 1px 2px #000}
+  #compass .strip span{position:absolute;top:3px;transform:translateX(-50%)}
+  #compass .strip span.m{color:#6d7277;font-weight:400}
+  #compass::after{content:'';position:absolute;left:50%;bottom:0;width:2px;height:6px;margin-left:-1px;background:var(--acc)}
+  #mini{position:absolute;right:16px;top:14px;width:188px;height:188px;border-radius:50%;overflow:hidden;opacity:.92;
+    border:1px solid rgba(255,255,255,.14);box-shadow:0 0 0 1px rgba(0,0,0,.5)}
+  #feed{position:absolute;right:16px;top:214px;display:flex;flex-direction:column;align-items:flex-end;gap:4px;font-size:12px}
+  #feed div{background:rgba(8,9,10,.55);padding:4px 9px;border-radius:3px;color:#dfe2e5;text-shadow:0 1px 2px #000;transition:opacity .6s}
+  #feed div b{color:var(--acc);font-weight:600}
+  #feed div.fade{opacity:0}
+  #prompt{position:absolute;left:50%;top:calc(50% + 48px);transform:translateX(-50%);font-size:13px;letter-spacing:.08em;color:#e8eaec;
+    text-shadow:0 1px 3px #000;opacity:0;transition:opacity .15s;text-align:center}
+  #prompt b{display:inline-block;padding:1px 7px;margin-right:6px;border:1px solid rgba(255,255,255,.6);border-radius:3px;font:600 12px ui-monospace,Menlo,Consolas,monospace}
+  #prompt .bar{height:3px;margin-top:6px;background:rgba(255,255,255,.15);border-radius:2px;overflow:hidden}
+  #prompt .bar i{display:block;height:100%;width:0;background:var(--acc)}
+  @media (max-width:900px), (max-height:560px){ #mini{width:132px;height:132px} #feed{top:156px} #hints{display:none} }
+  #fps{position:fixed;left:8px;bottom:64px;z-index:40;display:none;color:#9aa;font:11px/1.5 ui-monospace,Menlo,Consolas,monospace;text-shadow:0 0 3px #000;pointer-events:none}
+  @media (max-width:860px){ #menu .wrap{grid-template-columns:1fr} #minimap{max-height:52vh} }
+</style>
+</head>
+<body data-team="ALPHA">
+<div id="g_load">
+  <h1>ANGAR-07</h1>
+  <div class="sub">ALPHA · DELTA · SHOOT HOUSE</div>
+  <div id="g_status">Загрузка…</div>
+  <div class="spin"></div>
+</div>
+
+<div id="menu">
+  <div class="wrap">
+    <div>
+      <h2 id="menu_title">ANGAR-07</h2>
+      <div class="sub">ВЫБОР КОМАНДЫ И ТОЧКИ</div>
+      <div class="teams">
+        <div class="team sel" id="team_ALPHA"><img alt=""><b>ALPHA</b><span>запад · чёрный</span></div>
+        <div class="team" id="team_DELTA"><img alt=""><b>DELTA</b><span>восток · камуфляж</span></div>
+      </div>
+      <div class="lbl">ТОЧКА ВОЗРОЖДЕНИЯ</div>
+      <div id="spawns"></div>
+      <div class="btns">
+        <button class="main" id="go">В БОЙ</button>
+        <button class="ghost" id="resume" style="display:none">ПРОДОЛЖИТЬ</button>
+        <button class="ghost" id="spectate">НАБЛЮДАТЕЛЬ</button>
+        <button class="ghost" id="fullscreen" title="В полноэкранном режиме клавиатура захватывается: Ctrl можно использовать для приседа">ПОЛНЫЙ ЭКРАН</button>
+      </div>
+      <div id="m_msg"></div>
+      <div id="q_line">качество: <span id="q_name"></span> · ?q=low|med|high|ultra</div>
+    </div>
+    <div>
+      <div class="tabs"><button id="tab_map" class="sel">КАРТА</button><button id="tab_set">НАСТРОЙКИ</button></div>
+      <div id="mappane">
+        <canvas id="minimap" width="840" height="640"></canvas>
+        <div class="keys" id="keys"></div>
+      </div>
+      <div id="settings">
+        <div class="row"><span>Чувствительность мыши</span><input type="range" id="s_sens" min="0.2" max="3" step="0.05"><output id="o_sens"></output></div>
+        <div class="row"><span>Чувствительность в прицеле</span><input type="range" id="s_ads" min="0.2" max="1.5" step="0.05"><output id="o_ads"></output></div>
+        <div class="row"><span>Инверсия по вертикали</span><input type="checkbox" id="s_inv" style="justify-self:start"><output></output></div>
+        <div class="row"><span>Поле зрения (FOV)</span><input type="range" id="s_fov" min="60" max="100" step="1"><output id="o_fov"></output></div>
+        <div class="row"><span>Громкость</span><input type="range" id="s_vol" min="0" max="100" step="1"><output id="o_vol"></output></div>
+        <div class="row"><span>Яркость</span><input type="range" id="s_exp" min="0.6" max="1.6" step="0.02"><output id="o_exp"></output></div>
+        <div class="row"><span>Тонмаппинг</span><select id="s_tone"><option value="agx">AgX</option><option value="neutral">Neutral</option><option value="aces">ACES</option></select><output></output></div>
+        <div class="lbl" style="margin-top:14px">НАЗНАЧЕНИЕ КЛАВИШ · клик по кнопке, затем клавиша (Esc — отмена)</div>
+        <div id="binds"></div>
+        <div class="btns" style="margin-top:14px"><button class="ghost" id="s_reset">СБРОСИТЬ ВСЁ</button></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="hud">
+  <div id="dmg"></div><div id="concuss"></div><div id="burn"></div>
+  <div id="burnmsg">ГОРИШЬ · <b id="burnkey">C</b> — СБИТЬ ПЛАМЯ</div>
+  <div id="cross"><i></i><i></i><i></i><i></i><i></i></div>
+  <div id="hitm"><i></i><i></i><i></i><i></i></div>
+  <div id="dmgdir"><i></i><i></i><i></i><i></i></div>
+  <div id="compass"><div class="strip"></div></div>
+  <div id="clock"></div>
+  <canvas id="mini" width="376" height="376"></canvas>
+  <div id="feed"></div>
+  <div id="prompt"></div>
+  <div id="hints"></div>
+  <div class="panel" id="p_hp">
+    <img id="hud_emblem" alt="">
+    <div><div id="hud_team"></div><div id="hp_wrap"><div id="hp_bar"></div></div></div>
+    <div id="hp_num">100</div>
+  </div>
+  <div class="panel" id="p_ammo"><div id="ammo">30 / 120</div><div id="nades"></div></div>
+  <div id="dead">ВЫБЫЛ</div>
+</div>
+<div id="fps"></div>
+
+<script>
+/* Сторож загрузки: любая ошибка до старта игры (WebGL, сбой модуля, нехватка
+   памяти) показывается на экране загрузки, а не прячется в консоли. */
+(function(){
+  var shown = false;
+  window.__angarFatal = function(title, detail){
+    if(shown) return; shown = true;
+    var box = document.getElementById('g_load'); if(!box) return;
+    box.style.display = 'flex';
+    box.innerHTML = '<h1>ANGAR-07</h1><div class="sub">НЕ УДАЛОСЬ ЗАПУСТИТЬ КАРТУ</div>' +
+      '<div class="err"><b></b><p></p><button class="main" onclick="location.reload()">ПЕРЕЗАГРУЗИТЬ</button></div>';
+    box.querySelector('.err b').textContent = title;
+    box.querySelector('.err p').textContent = detail || '';
+  };
+  function booting(){ return !window.ANGAR; }
+  window.addEventListener('error', function(e){
+    if(!booting()) return;
+    window.__angarFatal('Ошибка при загрузке', (e.message || String(e.error || '')) + (e.filename ? '' : ''));
+  });
+  window.addEventListener('unhandledrejection', function(e){
+    if(!booting()) return;
+    var r = e.reason; if(r && r.angarShown) return;
+    window.__angarFatal('Ошибка при загрузке', String(r && r.message || r));
+  });
+  // модуль игры не стартовал вовсе (старый браузер без ES-модулей и т. п.)
+  setTimeout(function(){ if(!window.__angarBoot) window.__angarFatal('Игра не запустилась',
+    'Браузер не выполнил модуль игры. Нужен Chrome / Edge / Firefox / Safari последних версий.'); }, 15000);
+})();
+</script>
+<!--THREE_BUNDLE-->
+<script type="module">
+<!--GAME-->
+</script>
+
+<!-- ===================== ammo.js (Bullet Physics), zlib license ===================== -->
+<script>
+<!--AMMO-->
+</script>
+<script type="application/octet-stream" id="ammo-wasm"><!--AMMO_WASM--></script>
+</body>
+</html>
